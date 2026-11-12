@@ -92,6 +92,20 @@ export function SettingsView() {
             <span className="text-xs text-muted">Keep an ID available for {prefs.trackBuffer} analyzed frames during brief occlusions.</span>
           </label>
           <label className="block text-sm">
+            Tracking algorithm
+            <select
+              className="mt-2 h-10 w-full rounded-xl border border-slate-200 bg-white px-3"
+              value={prefs.trackerType ?? "bytetrack"}
+              onChange={(event) =>
+                update({ ...prefs, trackerType: event.target.value as "bytetrack" | "botsort" })
+              }
+            >
+              <option value="bytetrack">ByteTrack (Fast, high-association multi-stage matching)</option>
+              <option value="botsort">BoT-SORT (Motion-compensated tracking, robust for occlusions)</option>
+            </select>
+            <span className="text-xs text-muted">Ultralytics multi-object tracking backend for vehicle trajectory persistence.</span>
+          </label>
+          <label className="block text-sm">
             Max frames to analyze
             <input
               className="mt-2 h-10 w-full rounded-xl border border-slate-200 bg-white px-3"

@@ -53,11 +53,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   const [video, setVideo] = useState<VideoRecord | null>(null);
   const [videoDuration, setVideoDuration] = useState<number>(0);
   const [detections, setDetections] = useState<DetectionRecord[]>([]);
-  const [liveDetections, setLiveDetections] = useState<DetectionRecord[]>([]);
-  const liveHistoryRef = useRef<DetectionRecord[]>([]);
-  const nextLiveTrackIdRef = useRef(-1);
-  const liveSessionIdRef = useRef<string | null>(null);
-  const liveFrameNumberRef = useRef(0);
+  const [playbackMode, setPlaybackMode] = useState<"overlay" | "annotated">("overlay");
   const [violations, setViolations] = useState<ViolationRecord[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [now, setNow] = useState(0);
@@ -218,132 +214,6 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
         data?.videos.find((item) => item.id === viewJob?.video_id || item.latest_job?.id === jobId) ??
         null;
 
-  useEffect(() => {
-    setLiveDetections([]);
-    liveHistoryRef.current = [];
-    nextLiveTrackIdRef.current = -1;
-    liveSessionIdRef.current = null;
-    liveFrameNumberRef.current = 0;
-    if (!isVideoPlaying || data?.source === "sample" || !apiBase()) return;
-    let stopped = false;
-    let inFlight = false;
-    const media = videoRef.current;
-    if (!media) return;
-    const liveSessionId = liveSessionIdRef.current ?? globalThis.crypto?.randomUUID?.() ?? `playback-${jobId}-${Date.now()}`;
-    liveSessionIdRef.current = liveSessionId;
-
-    const inferPlaybackFrame = async () => {
-      if (stopped || inFlight || media.paused || !media.videoWidth || !media.videoHeight) return;
-      inFlight = true;
-      const capturedAt = media.currentTime;
-      const frameNumber = liveFrameNumberRef.current++;
-      const sourceWidth = media.videoWidth;
-      const sourceHeight = media.videoHeight;
-      const scale = Math.min(1, 960 / sourceWidth);
-      const frameCanvas = document.createElement("canvas");
-      frameCanvas.width = Math.max(1, Math.round(sourceWidth * scale));
-      frameCanvas.height = Math.max(1, Math.round(sourceHeight * scale));
-      const context = frameCanvas.getContext("2d");
-      if (!context) {
-        inFlight = false;
-        return;
-      }
-      try {
-        context.drawImage(media, 0, 0, frameCanvas.width, frameCanvas.height);
-        const blob = await new Promise<Blob | null>((resolve) =>
-          frameCanvas.toBlob(resolve, "image/jpeg", 0.78),
-        );
-        if (!blob || stopped) return;
-        const body = new FormData();
-        body.append("file", blob, "playback-frame.jpg");
-        body.append("conf", String(viewJob?.config.conf ?? 0.25));
-        body.append("iou", String(viewJob?.config.iou ?? 0.5));
-        body.append("session_id", liveSessionId);
-        body.append("frame_number", String(frameNumber));
-        body.append("timestamp_sec", String(capturedAt));
-        const result = await apiSend<{
-          items: {
-            class_name: string;
-            class_id: number;
-            confidence: number;
-            bbox: number[];
-            tracking_id?: number | null;
-            track_id?: number | null;
-          }[];
-        }>("/api/detect/frame", { method: "POST", body });
-        if (stopped || media.paused) return;
-
-        const previousByTrack = new Map<number, DetectionRecord>();
-        for (const item of liveHistoryRef.current) {
-          if (item.timestamp_sec > capturedAt || item.tracking_id == null) continue;
-          const current = previousByTrack.get(item.tracking_id);
-          if (!current || item.timestamp_sec > current.timestamp_sec) {
-            previousByTrack.set(item.tracking_id, item);
-          }
-        }
-        const previous = [...previousByTrack.values()];
-        const matched = new Set<number>();
-        const frameDetections: DetectionRecord[] = result.items.map((item, index) => {
-          const bbox = item.bbox.map((coordinate) => coordinate / scale);
-          let bestIndex = -1;
-          let bestIou = 0.15;
-          previous.forEach((candidate, candidateIndex) => {
-            if (matched.has(candidateIndex) || candidate.class_name !== item.class_name) return;
-            const overlap = detectionIoU(candidate.bbox, bbox);
-            if (overlap > bestIou) {
-              bestIou = overlap;
-              bestIndex = candidateIndex;
-            }
-          });
-          const trackingId = item.tracking_id ?? item.track_id ?? (bestIndex >= 0
-            ? previous[bestIndex].tracking_id!
-            : nextLiveTrackIdRef.current--);
-          if (bestIndex >= 0) matched.add(bestIndex);
-          return {
-            id: `live-${jobId}-${capturedAt.toFixed(3)}-${index}`,
-            job_id: jobId,
-            video_id: viewJob?.video_id ?? "",
-            frame_number: frameNumber,
-            frame_index: frameNumber,
-            timestamp_sec: capturedAt,
-            timestamp: capturedAt,
-            class_name: item.class_name,
-            class_id: item.class_id,
-            confidence: item.confidence,
-            bbox,
-            tracking_id: trackingId,
-            track_id: trackingId,
-            sample: false,
-          };
-        });
-        const historyByTrack = new Map<number, DetectionRecord[]>();
-        for (const item of [...liveHistoryRef.current, ...frameDetections]) {
-          if (item.tracking_id == null) continue;
-          const history = historyByTrack.get(item.tracking_id) ?? [];
-          history.push(item);
-          historyByTrack.set(item.tracking_id, history);
-        }
-        liveHistoryRef.current = [...historyByTrack.values()].flatMap((history) =>
-          history
-            .filter((item) => capturedAt - item.timestamp_sec <= 6)
-            .sort((a, b) => a.timestamp_sec - b.timestamp_sec)
-            .slice(-2),
-        );
-        setLiveDetections(liveHistoryRef.current);
-      } catch {
-        // Playback inference is best effort; background analysis keeps running.
-      } finally {
-        inFlight = false;
-      }
-    };
-
-    void inferPlaybackFrame();
-    const interval = window.setInterval(() => void inferPlaybackFrame(), 400);
-    return () => {
-      stopped = true;
-      window.clearInterval(interval);
-    };
-  }, [data?.source, isVideoPlaying, jobId, viewJob?.config.conf, viewJob?.config.iou, viewJob?.video_id]);
   const viewDetections = useMemo(
     () => (data?.source === "sample" ? sampleView?.detections ?? [] : detections),
     [data?.source, detections, sampleView],
@@ -463,45 +333,16 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   const effectiveNow = now;
 
   const visible = useMemo(() => {
-    const liveByTrack = new Map<number, DetectionRecord[]>();
-    for (const item of liveDetections) {
-      if (item.tracking_id == null || item.timestamp_sec > effectiveNow) continue;
-      const history = liveByTrack.get(item.tracking_id) ?? [];
-      history.push(item);
-      liveByTrack.set(item.tracking_id, history);
-    }
-    const liveNow = [...liveByTrack.values()]
-      .map((history) => history.sort((a, b) => a.timestamp_sec - b.timestamp_sec))
-      .filter((history) => effectiveNow - history[history.length - 1].timestamp_sec <= 3.5)
-      .map((history) => {
-          const item = history[history.length - 1];
-          const previous = history.length > 1 ? history[history.length - 2] : undefined;
-          if (!previous || item.timestamp_sec <= previous.timestamp_sec) return item;
-          const seconds = item.timestamp_sec - previous.timestamp_sec;
-          return {
-            ...item,
-            timestamp_sec: effectiveNow,
-            bbox: item.bbox.map((coordinate, index) =>
-              coordinate + ((coordinate - previous.bbox[index]) / seconds) * Math.min(2.5, Math.max(0, effectiveNow - item.timestamp_sec)),
-            ),
-          };
-      })
-      .filter((item) => item.confidence >= (viewJob?.config?.conf ?? 0.25));
-    if (liveNow.length > 0) {
-      return liveNow;
+    if (processingThrough > 0 && effectiveNow > processingThrough + 0.15) {
+      return [];
     }
     const { byTrack, untracked } = detectionsByTrack;
     const displayThreshold = viewJob?.config?.conf ?? 0.25;
-    // Keep boxes tied to nearby analyzed timestamps, interpolating only across
-    // short gaps in the same stored track.
-    const snapWindow = Math.max(0.25, detectionGap * 0.5);
-    const interpolationGap = Math.max(2.0, detectionGap * 3);
+    const maxSnapWindow = Math.min(0.2, Math.max(0.06, detectionGap * 0.75));
+    const maxInterpolationGap = Math.min(0.4, Math.max(0.12, detectionGap * 2.0));
     const active: DetectionRecord[] = [];
 
     for (const trackDetections of byTrack.values()) {
-      const trackSnapWindow = snapWindow;
-      const trackInterpolationGap = interpolationGap;
-      // Binary search: find insertion point for effectiveNow
       let lo = 0;
       let hi = trackDetections.length;
       while (lo < hi) {
@@ -513,19 +354,18 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       const before = lo > 0 ? trackDetections[lo - 1] : null;
       const after = lo < trackDetections.length ? trackDetections[lo] : null;
 
-      // Case 1: interpolate between two nearby detections
       if (
         before &&
         after &&
-        after.timestamp_sec - before.timestamp_sec <= trackInterpolationGap
+        after.timestamp_sec - before.timestamp_sec <= maxInterpolationGap
       ) {
         const span = after.timestamp_sec - before.timestamp_sec;
-        if (span === 0) {
-          active.push(after);
+        if (span <= 0.0001) {
+          if (after.confidence >= displayThreshold) active.push(after);
           continue;
         }
         const t = Math.max(0, Math.min(1, (effectiveNow - before.timestamp_sec) / span));
-        const interpolated = {
+        const interpolated: DetectionRecord = {
           ...before,
           timestamp_sec: effectiveNow,
           bbox: before.bbox.map(
@@ -536,7 +376,6 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
         continue;
       }
 
-      // Snap to a nearby observation; never draw a live box beyond its last detected frame.
       const nearest =
         before && after
           ? effectiveNow - before.timestamp_sec < after.timestamp_sec - effectiveNow
@@ -546,23 +385,23 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       if (
         nearest &&
         nearest.confidence >= displayThreshold &&
-        Math.abs(nearest.timestamp_sec - effectiveNow) <= trackSnapWindow
+        Math.abs(nearest.timestamp_sec - effectiveNow) <= maxSnapWindow
       ) {
         active.push(nearest);
       }
     }
 
-    // Untracked: snap within window
     for (const detection of untracked) {
       if (
         detection.confidence >= displayThreshold &&
-        Math.abs(detection.timestamp_sec - effectiveNow) <= snapWindow
-      )
+        Math.abs(detection.timestamp_sec - effectiveNow) <= maxSnapWindow
+      ) {
         active.push(detection);
+      }
     }
 
     return active;
-  }, [detectionsByTrack, detectionGap, effectiveNow, liveDetections, viewJob?.config?.conf]);
+  }, [detectionsByTrack, detectionGap, effectiveNow, processingThrough, viewJob?.config?.conf]);
 
   const tracks = detectionsByTrack.byTrack.size;
 
@@ -571,8 +410,6 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
     const media = videoRef.current;
     if (!canvas || !media) return;
 
-    // Size the canvas to the video's display rect.
-    // Fall back to offsetWidth if clientWidth isn't ready yet.
     const width = media.clientWidth || media.offsetWidth;
     const height = media.clientHeight || media.offsetHeight;
     if (!width || !height) {
@@ -585,10 +422,13 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
     if (!context) return;
     context.clearRect(0, 0, width, height);
 
-    // Scale factors: from raw video-pixel bbox coordinates → canvas display pixels.
-    // Priority: live video intrinsic size > DB video metadata > canvas size (1:1 fallback).
-    const vw = media.videoWidth || viewVideo?.width || width;
-    const vh = media.videoHeight || viewVideo?.height || height;
+    if (playbackMode === "annotated") {
+      return;
+    }
+
+    const vw = media.videoWidth || viewVideo?.width;
+    const vh = media.videoHeight || viewVideo?.height;
+    if (!vw || !vh || vw <= 0 || vh <= 0) return;
     const objectFit = getComputedStyle(media).objectFit;
     const containScale = Math.min(width / vw, height / vh);
     const scale =
