@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: trafficai-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: CORS_ORIGINS
+        sync: false
+      - key: YOLO_WEIGHTS
+        value: yolo11n.pt
+      - key: ALLOW_WEIGHT_DOWNLOAD
+        value: "true"
+      - key: DATA_DIR
+        value: /data
+      - key: PYTHONUNBUFFERED
+        value: "1"
