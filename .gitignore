@@ -1,13 +1,44 @@
-node_modules
-.next
-frontend/.env.local
-backend/.env
-backend/data
-backend/.venv
-**/__pycache__
-**/*.pyc
-.pytest_cache
-*.pt
-.DS_Store
+# Local secrets and configuration
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example
 
-.git-frontend-backup
+# Node dependencies and generated output
+**/node_modules/
+**/.next/
+**/out/
+**/dist/
+**/build/
+**/coverage/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+
+# Python environments, caches, and test artifacts
+**/__pycache__/
+*.py[cod]
+*$py.class
+**/.venv/
+**/venv/
+**/ENV/
+**/.pytest_cache/
+**/.pytest-*/
+**/.tox/
+**/.nox/
+pytestdebug.log
+
+# Runtime data and downloaded model weights
+/backend/data/
+*.pt
+
+# Logs, editor files, and operating system metadata
+*.log
+*.pem
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Preserved metadata from the original frontend-only Git repository
+/.git-frontend-backup/
