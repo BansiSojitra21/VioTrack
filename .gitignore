@@ -1,3 +1,4 @@
+# Git ignore file for a monorepo containing both frontend and backend code
 # Local secrets and configuration
 **/.env
 **/.env.*
