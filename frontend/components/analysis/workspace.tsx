@@ -42,6 +42,106 @@ function detectionIoU(a: number[], b: number[]): number {
   return intersection / Math.max(areaA + areaB - intersection, 1);
 }
 
+interface PlaybackDetection {
+  class_name: string;
+  class_id?: number;
+  confidence: number;
+  bbox: number[];
+  tracking_id?: number | null;
+  track_id?: number | null;
+}
+
+function groupDetections(items: DetectionRecord[]) {
+  const ordered = [...items].sort((a, b) => a.timestamp_sec - b.timestamp_sec);
+  const byTrack = new Map<number, DetectionRecord[]>();
+  const untracked: DetectionRecord[] = [];
+  for (const detection of ordered) {
+    if (!DISPLAY_VEHICLE_CLASSES.has(detection.class_name)) continue;
+    if (detection.tracking_id == null) {
+      untracked.push(detection);
+      continue;
+    }
+    const track = byTrack.get(detection.tracking_id);
+    if (track) track.push(detection);
+    else byTrack.set(detection.tracking_id, [detection]);
+  }
+  return { byTrack, untracked };
+}
+
+function medianGap(byTrack: Map<number, DetectionRecord[]>) {
+  const gaps: number[] = [];
+  for (const trackDetections of byTrack.values()) {
+    for (let index = 1; index < trackDetections.length; index += 1) {
+      const gap = trackDetections[index].timestamp_sec - trackDetections[index - 1].timestamp_sec;
+      if (gap > 0 && gap < 10) gaps.push(gap);
+    }
+  }
+  if (gaps.length === 0) return 0.5;
+  gaps.sort((a, b) => a - b);
+  return gaps[Math.floor(gaps.length / 2)];
+}
+
+function boxesAtPlayhead(
+  byTrack: Map<number, DetectionRecord[]>,
+  untracked: DetectionRecord[],
+  time: number,
+  detectionGap: number,
+  minConfidence: number,
+) {
+  const maxSnapWindow = Math.min(0.35, Math.max(0.08, detectionGap * 0.75));
+  const maxInterpolationGap = Math.min(1.5, Math.max(0.35, detectionGap * 2.5));
+  const active: DetectionRecord[] = [];
+
+  for (const trackDetections of byTrack.values()) {
+    let lo = 0;
+    let hi = trackDetections.length;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (trackDetections[mid].timestamp_sec < time) lo = mid + 1;
+      else hi = mid;
+    }
+
+    const before = lo > 0 ? trackDetections[lo - 1] : null;
+    const after = lo < trackDetections.length ? trackDetections[lo] : null;
+    if (before && after && after.timestamp_sec - before.timestamp_sec <= maxInterpolationGap) {
+      const span = after.timestamp_sec - before.timestamp_sec;
+      if (span <= 0.0001) {
+        if (after.confidence >= minConfidence) active.push(after);
+        continue;
+      }
+      const progress = Math.max(0, Math.min(1, (time - before.timestamp_sec) / span));
+      const interpolated: DetectionRecord = {
+        ...before,
+        timestamp_sec: time,
+        bbox: before.bbox.map((coord, index) => coord + (after.bbox[index] - coord) * progress),
+      };
+      if (interpolated.confidence >= minConfidence) active.push(interpolated);
+      continue;
+    }
+
+    const nearest =
+      before && after
+        ? time - before.timestamp_sec < after.timestamp_sec - time
+          ? before
+          : after
+        : (before ?? after);
+    if (
+      nearest &&
+      nearest.confidence >= minConfidence &&
+      Math.abs(nearest.timestamp_sec - time) <= maxSnapWindow
+    ) {
+      active.push(nearest);
+    }
+  }
+
+  for (const detection of untracked) {
+    if (detection.confidence >= minConfidence && Math.abs(detection.timestamp_sec - time) <= maxSnapWindow) {
+      active.push(detection);
+    }
+  }
+  return active;
+}
+
 export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   const { status, data, error } = useTrafficData();
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -49,6 +149,13 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   const detectionsRef = useRef<DetectionRecord[]>([]);
   const previewedDuringAnalysisRef = useRef(false);
   const replayWithDetectionsStartedRef = useRef(false);
+  const liveTracksRef = useRef<Map<number, DetectionRecord[]>>(new Map());
+  const captureBusyRef = useRef(false);
+  const lastCaptureAtRef = useRef(-1);
+  const sessionGenRef = useRef(0);
+  const jobStatusRef = useRef<JobRecord["status"] | undefined>(undefined);
+  const captureNoticeRef = useRef(false);
+  const [liveDetections, setLiveDetections] = useState<DetectionRecord[]>([]);
   const [job, setJob] = useState<JobRecord | null>(null);
   const [video, setVideo] = useState<VideoRecord | null>(null);
   const [videoDuration, setVideoDuration] = useState<number>(0);
@@ -73,6 +180,12 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   useEffect(() => {
     previewedDuringAnalysisRef.current = false;
     replayWithDetectionsStartedRef.current = false;
+    liveTracksRef.current = new Map();
+    captureBusyRef.current = false;
+    lastCaptureAtRef.current = -1;
+    sessionGenRef.current += 1;
+    captureNoticeRef.current = false;
+    setLiveDetections([]);
   }, [jobId]);
   const sampleView = useMemo(() => {
     if (!data || data.source !== "sample") return null;
@@ -206,6 +319,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   }, [data, jobId, status, video]);
 
   const viewJob = data?.source === "sample" ? sampleView?.job ?? null : job;
+  jobStatusRef.current = viewJob?.status;
   const viewVideo =
     data?.source === "sample"
       ? sampleView?.video ?? null
@@ -223,37 +337,14 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
     () => (data?.source === "sample" ? sampleView?.violations ?? [] : violations),
     [data?.source, sampleView, violations],
   );
-  const detectionsByTrack = useMemo(() => {
-    const ordered = [...overlayDetections].sort((a, b) => a.timestamp_sec - b.timestamp_sec);
-    const byTrack = new Map<number, DetectionRecord[]>();
-    const untracked: DetectionRecord[] = [];
-    for (const detection of ordered) {
-      if (!DISPLAY_VEHICLE_CLASSES.has(detection.class_name)) continue;
-      if (detection.tracking_id == null) {
-        untracked.push(detection);
-        continue;
-      }
-      const track = byTrack.get(detection.tracking_id);
-      if (track) track.push(detection);
-      else byTrack.set(detection.tracking_id, [detection]);
-    }
-    return { byTrack, untracked };
-  }, [overlayDetections]);
-
-  // Compute actual median inter-detection gap from the data, not from configured FPS.
-  // This makes box visibility work regardless of frame stride setting.
-  const detectionGap = useMemo(() => {
-    const gaps: number[] = [];
-    for (const trackDets of detectionsByTrack.byTrack.values()) {
-      for (let i = 1; i < trackDets.length; i++) {
-        const g = trackDets[i].timestamp_sec - trackDets[i - 1].timestamp_sec;
-        if (g > 0 && g < 10) gaps.push(g);
-      }
-    }
-    if (gaps.length === 0) return 0.5; // safe default: 500ms
-    gaps.sort((a, b) => a - b);
-    return gaps[Math.floor(gaps.length / 2)]; // median gap
-  }, [detectionsByTrack]);
+  const detectionsByTrack = useMemo(() => groupDetections(overlayDetections), [overlayDetections]);
+  const detectionGap = useMemo(() => medianGap(detectionsByTrack.byTrack), [detectionsByTrack]);
+  const liveGrouped = useMemo(() => groupDetections(liveDetections), [liveDetections]);
+  const liveGap = useMemo(() => medianGap(liveGrouped.byTrack), [liveGrouped]);
+  const storedUntil = useMemo(
+    () => viewDetections.reduce((max, item) => Math.max(max, item.timestamp_sec), -1),
+    [viewDetections],
+  );
 
   const fps = viewVideo?.fps || 25;
   const stride = viewJob?.config?.frame_stride ?? 1;
@@ -331,79 +422,171 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   }, [overlayDetections, viewViolations, viewJob?.config, viewVideo]);
 
   const effectiveNow = now;
+  const useSavedTracks =
+    data?.source === "sample" ||
+    viewJob?.status === "completed" ||
+    viewJob?.status === "cancelled" ||
+    viewJob?.status === "failed" ||
+    (storedUntil >= 0 && effectiveNow <= storedUntil + 0.25);
 
   const visible = useMemo(() => {
-    if (processingThrough > 0 && effectiveNow > processingThrough + 0.15) {
-      return [];
-    }
-    const { byTrack, untracked } = detectionsByTrack;
     const displayThreshold = viewJob?.config?.conf ?? 0.25;
-    const maxSnapWindow = Math.min(0.2, Math.max(0.06, detectionGap * 0.75));
-    const maxInterpolationGap = Math.min(0.4, Math.max(0.12, detectionGap * 2.0));
-    const active: DetectionRecord[] = [];
+    if (useSavedTracks) {
+      return boxesAtPlayhead(
+        detectionsByTrack.byTrack,
+        detectionsByTrack.untracked,
+        effectiveNow,
+        detectionGap,
+        displayThreshold,
+      );
+    }
+    return boxesAtPlayhead(
+      liveGrouped.byTrack,
+      liveGrouped.untracked,
+      effectiveNow,
+      liveGap,
+      displayThreshold,
+    );
+  }, [
+    detectionGap,
+    detectionsByTrack,
+    effectiveNow,
+    liveGap,
+    liveGrouped,
+    useSavedTracks,
+    viewJob?.config?.conf,
+  ]);
 
-    for (const trackDetections of byTrack.values()) {
-      let lo = 0;
-      let hi = trackDetections.length;
-      while (lo < hi) {
-        const mid = Math.floor((lo + hi) / 2);
-        if (trackDetections[mid].timestamp_sec < effectiveNow) lo = mid + 1;
-        else hi = mid;
+  const tracks = useSavedTracks ? detectionsByTrack.byTrack.size : Math.max(liveGrouped.byTrack.size, detectionsByTrack.byTrack.size);
+
+  useEffect(() => {
+    const active = viewJob?.status === "pending" || viewJob?.status === "processing";
+    if (!isVideoPlaying || !active || data?.source === "sample" || !apiBase()) return;
+
+    let stopped = false;
+    let timer = 0;
+    const schedule = (delay: number) => {
+      timer = window.setTimeout(() => {
+        void capture();
+      }, delay);
+    };
+
+    const capture = async () => {
+      if (stopped) return;
+      const videoEl = videoRef.current;
+      const status = jobStatusRef.current;
+      if (!videoEl || videoEl.paused || videoEl.ended) return;
+      if (status !== "pending" && status !== "processing") return;
+      const time = videoEl.currentTime;
+      const coveredUntil = detectionsRef.current.reduce((max, item) => Math.max(max, item.timestamp_sec), -1);
+      if (coveredUntil >= 0 && time <= coveredUntil + 0.25) {
+        schedule(200);
+        return;
+      }
+      const captureIsCurrent = lastCaptureAtRef.current >= 0 && time >= lastCaptureAtRef.current;
+      if (
+        captureBusyRef.current ||
+        (captureIsCurrent && time - lastCaptureAtRef.current < 0.3)
+      ) {
+        schedule(80);
+        return;
+      }
+      if (!videoEl.videoWidth || !videoEl.videoHeight) {
+        schedule(200);
+        return;
+      }
+      if (lastCaptureAtRef.current >= 0 && Math.abs(time - lastCaptureAtRef.current) > 1.2) {
+        sessionGenRef.current += 1;
+        liveTracksRef.current = new Map();
+        setLiveDetections([]);
       }
 
-      const before = lo > 0 ? trackDetections[lo - 1] : null;
-      const after = lo < trackDetections.length ? trackDetections[lo] : null;
-
-      if (
-        before &&
-        after &&
-        after.timestamp_sec - before.timestamp_sec <= maxInterpolationGap
-      ) {
-        const span = after.timestamp_sec - before.timestamp_sec;
-        if (span <= 0.0001) {
-          if (after.confidence >= displayThreshold) active.push(after);
-          continue;
+      const canvas = document.createElement("canvas");
+      canvas.width = videoEl.videoWidth;
+      canvas.height = videoEl.videoHeight;
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      try {
+        context.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+      } catch {
+        if (!captureNoticeRef.current) {
+          captureNoticeRef.current = true;
+          toast.error("The browser blocked frame capture, so boxes ahead of the saved analysis cannot be drawn.");
         }
-        const t = Math.max(0, Math.min(1, (effectiveNow - before.timestamp_sec) / span));
-        const interpolated: DetectionRecord = {
-          ...before,
-          timestamp_sec: effectiveNow,
-          bbox: before.bbox.map(
-            (coord, i) => coord + (after.bbox[i] - coord) * t,
-          ),
-        };
-        if (interpolated.confidence >= displayThreshold) active.push(interpolated);
-        continue;
+        return;
       }
-
-      const nearest =
-        before && after
-          ? effectiveNow - before.timestamp_sec < after.timestamp_sec - effectiveNow
-            ? before
-            : after
-          : before ?? after;
-      if (
-        nearest &&
-        nearest.confidence >= displayThreshold &&
-        Math.abs(nearest.timestamp_sec - effectiveNow) <= maxSnapWindow
-      ) {
-        active.push(nearest);
+      captureBusyRef.current = true;
+      lastCaptureAtRef.current = time;
+      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.72));
+      if (!blob || stopped) {
+        captureBusyRef.current = false;
+        if (!stopped) schedule(200);
+        return;
       }
-    }
-
-    for (const detection of untracked) {
-      if (
-        detection.confidence >= displayThreshold &&
-        Math.abs(detection.timestamp_sec - effectiveNow) <= maxSnapWindow
-      ) {
-        active.push(detection);
+      const body = new FormData();
+      body.append("file", blob, "frame.jpg");
+      body.append("conf", String(viewJob?.config?.conf ?? 0.25));
+      body.append("iou", String(viewJob?.config?.iou ?? 0.5));
+      body.append("session_id", `playback-${jobId}-${sessionGenRef.current}`);
+      const mediaFps = viewVideo?.fps || 25;
+      body.append("frame_number", String(Math.max(0, Math.round(time * mediaFps))));
+      body.append("timestamp_sec", String(time));
+      try {
+        const result = await apiSend<{ items: PlaybackDetection[] }>("/api/detect/frame", { method: "POST", body });
+        if (stopped) return;
+        const playhead = videoRef.current?.currentTime ?? time;
+        if (Math.abs(playhead - time) > 0.8) return;
+        if (jobStatusRef.current !== "pending" && jobStatusRef.current !== "processing") return;
+        const trackMap = liveTracksRef.current;
+        for (const item of result.items) {
+          const trackId = item.tracking_id ?? item.track_id;
+          if (trackId == null || !DISPLAY_VEHICLE_CLASSES.has(item.class_name)) continue;
+          const record: DetectionRecord = {
+            id: `live-${sessionGenRef.current}-${trackId}-${time.toFixed(3)}`,
+            job_id: jobId,
+            video_id: viewJob?.video_id ?? "",
+            frame_number: Math.max(0, Math.round(time * mediaFps)),
+            timestamp_sec: time,
+            class_name: item.class_name,
+            class_id: item.class_id ?? 0,
+            confidence: item.confidence,
+            bbox: item.bbox,
+            tracking_id: -Math.abs(trackId),
+            plate_number: null,
+            sample: false,
+          };
+          const points = trackMap.get(trackId) ?? [];
+          points.push(record);
+          if (points.length > 24) points.shift();
+          trackMap.set(trackId, points);
+        }
+        setLiveDetections([...trackMap.values()].flat());
+      } catch {
+        if (!captureNoticeRef.current) {
+          captureNoticeRef.current = true;
+          toast.error("Live boxes could not be scored. Saved boxes still appear as the background job reaches each moment.");
+        }
+      } finally {
+        captureBusyRef.current = false;
+        if (!stopped) schedule(40);
       }
-    }
+    };
 
-    return active;
-  }, [detectionsByTrack, detectionGap, effectiveNow, processingThrough, viewJob?.config?.conf]);
-
-  const tracks = detectionsByTrack.byTrack.size;
+    schedule(150);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    data?.source,
+    isVideoPlaying,
+    jobId,
+    viewJob?.config?.conf,
+    viewJob?.config?.iou,
+    viewJob?.status,
+    viewJob?.video_id,
+    viewVideo?.fps,
+  ]);
 
   const draw = useCallback(function draw() {
     const canvas = canvasRef.current;
@@ -737,6 +920,16 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
                   setNow(media.currentTime);
                   draw();
                 }}
+                onSeeked={(event) => {
+                  const time = event.currentTarget.currentTime;
+                  if (lastCaptureAtRef.current < 0 || Math.abs(time - lastCaptureAtRef.current) > 0.8) {
+                    sessionGenRef.current += 1;
+                    liveTracksRef.current = new Map();
+                    setLiveDetections([]);
+                    lastCaptureAtRef.current = -1;
+                  }
+                  setNow(time);
+                }}
                 onPlay={() => {
                   if (viewJob.status === "processing" || viewJob.status === "pending") {
                     previewedDuringAnalysisRef.current = true;
@@ -760,7 +953,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
           </div>
           {viewJob.status === "processing" || viewJob.status === "pending" ? (
             <p className="px-1 text-xs text-muted">
-              Playback runs independently. YOLO checks sampled playback frames with stable live track IDs; boxes follow vehicles and coast briefly through missed frames while background analysis continues. When analysis finishes, the video replays with the saved detection timeline.
+              The video plays from start to finish on its own. Until the background job reaches the playhead, boxes come from a separate YOLO pass on the frame you are watching, and each vehicle keeps that live track. The job keeps storing the full timeline, plates, and violations. Once it catches up, the overlay follows those saved tracks through the rest of the clip.
             </p>
           ) : viewJob.status === "failed" && viewJob.frames_processed < viewJob.frames_total ? (
             <p className="px-1 text-xs text-amber-700">
@@ -777,7 +970,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
             {visible.length === 0 ? (
               <li className="text-sm text-muted">
                 {viewJob.status === "processing" || viewJob.status === "pending"
-                  ? "YOLO has not saved a vehicle detection near this timestamp yet. Boxes will fill in as background analysis reaches this point."
+                  ? "Scoring this moment separately from the background analysis. A box appears as soon as that frame returns, then follows the vehicle."
                   : "No vehicle detections are stored near this timestamp."}
               </li>
             ) : null}

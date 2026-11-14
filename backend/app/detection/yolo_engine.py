@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
+import threading
 import weakref
 
 import numpy as np
@@ -20,8 +21,20 @@ from app.detection.types import Detection, clip_bbox
 
 logger = get_logger(__name__)
 
-# Cache loaded YOLO model instances to prevent reloading weights on every video job
+# Cache loaded YOLO model instances to prevent reloading weights on every video job.
+# Playback detection uses its own model so it cannot reset the analysis tracker.
 _MODEL_CACHE: dict[str, Any] = {}
+_MODEL_LOCKS: dict[str, threading.Lock] = {}
+_MODEL_LOCKS_GUARD = threading.Lock()
+
+
+def _shared_model_lock(target: str) -> threading.Lock:
+    with _MODEL_LOCKS_GUARD:
+        lock = _MODEL_LOCKS.get(target)
+        if lock is None:
+            lock = threading.Lock()
+            _MODEL_LOCKS[target] = lock
+        return lock
 
 
 class ModelUnavailableError(RuntimeError):
@@ -55,8 +68,11 @@ class YoloEngine:
         task_name: str = "vehicle",
         track_buffer: int | None = None,
         tracker_type: str = "bytetrack",
+        share_weights: bool = True,
     ) -> None:
         self.weights_setting = weights
+        self.share_weights = share_weights
+        self._infer_lock = threading.Lock()
         self.conf = settings.yolo_conf if conf is None else conf
         self.iou = settings.yolo_iou if iou is None else iou
         self.imgsz = settings.yolo_imgsz if imgsz is None else imgsz
@@ -126,11 +142,15 @@ class YoloEngine:
         try:
             resolved = settings.resolve_weights(self.weights_setting)
             target = str(resolved) if resolved else self.weights_setting
-            if target in _MODEL_CACHE:
-                self._model = _MODEL_CACHE[target]
+            if self.share_weights:
+                self._infer_lock = _shared_model_lock(target)
+                if target in _MODEL_CACHE:
+                    self._model = _MODEL_CACHE[target]
+                else:
+                    self._model = YOLO(target)
+                    _MODEL_CACHE[target] = self._model
             else:
                 self._model = YOLO(target)
-                _MODEL_CACHE[target] = self._model
             if self.device == "auto":
                 try:
                     import torch
@@ -197,14 +217,15 @@ class YoloEngine:
             predict_options["persist"] = True
             predict_options["tracker"] = tracker_path or "bytetrack.yaml"
         infer = self._model.track if use_tracker else self._model.predict
-        try:
-            return infer(frame, device=self.device, **predict_options)
-        except Exception:
-            if self.device == "cpu":
-                raise
-            logger.exception("YOLO inference failed on device %s; retrying on CPU", self.device)
-            self.device = "cpu"
-            return infer(frame, device="cpu", **predict_options)
+        with self._infer_lock:
+            try:
+                return infer(frame, device=self.device, **predict_options)
+            except Exception:
+                if self.device == "cpu":
+                    raise
+                logger.exception("YOLO inference failed on device %s; retrying on CPU", self.device)
+                self.device = "cpu"
+                return infer(frame, device="cpu", **predict_options)
 
     def _tracker_config_path(self) -> str:
         if self._tracker_config is not None:
@@ -300,6 +321,7 @@ def vehicle_engine(
     imgsz: int | None = None,
     track_buffer: int | None = None,
     tracker_type: str | None = None,
+    share_weights: bool = True,
 ) -> YoloEngine:
     return YoloEngine(
         weights=settings.yolo_weights,
@@ -310,6 +332,7 @@ def vehicle_engine(
         tracker_type=tracker_type or settings.yolo_tracker,
         class_filter=COCO_TRAFFIC_CLASSES,
         task_name="vehicle",
+        share_weights=share_weights,
     )
 
 

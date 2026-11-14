@@ -352,6 +352,7 @@ async def detect_frame(
     session_id: str = Form(default=""),
     frame_number: int = Form(default=0),
     timestamp_sec: float = Form(default=0.0),
+    imgsz: int = Form(default=0),
 ) -> dict:
     import numpy as np
 
@@ -449,7 +450,7 @@ def _frame_engine(conf: float, iou: float) -> Any:
     engine = _frame_engines.get(engine_key)
     if engine is None:
         _frame_engines.clear()
-        engine = vehicle_engine(conf, iou, settings.yolo_imgsz)
+        engine = vehicle_engine(conf, iou, settings.yolo_imgsz, share_weights=False)
         _frame_engines[engine_key] = engine
     return engine
 
