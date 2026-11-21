@@ -1,5 +1,6 @@
 # TrafficAI
 
+Hello!!!!
 TrafficAI is a traffic-monitoring workspace. The Next.js app is the dashboard. A separate FastAPI service runs YOLO, tracks vehicles, and flags **potential** violations for a person to review. It does not issue fines, and it does not invent detections when the model or a required rule input is missing.
 
 The browser app can deploy on Vercel. Video files and model inference stay on the Python service (Render, Railway, or any host that can run Docker or a long-lived Python process).
