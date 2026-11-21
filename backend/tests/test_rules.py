@@ -74,6 +74,20 @@ def test_live_frame_drops_near_identical_cross_class_boxes() -> None:
     assert filtered == [detections[2], detections[0]]
 
 
+def test_live_frame_collapses_nested_window_crop_into_car_body() -> None:
+    """Window/plate crop inside a full car body must not create a second ID."""
+    body = Detection(2, "car", 0.91, (900, 420, 1180, 700), tracking_id=2648)
+    window = Detection(2, "car", 0.66, (940, 440, 1040, 520), tracking_id=2562)
+    ghost = Detection(2, "car", float("inf"), (10, 10, 40, 40), tracking_id=2710)
+
+    filtered = _suppress_duplicate_frame_detections([body, window, ghost])
+
+    assert len(filtered) == 1
+    assert filtered[0].tracking_id == 2648
+    assert filtered[0].bbox == body.bbox
+    assert filtered[0].confidence == 0.91
+
+
 def test_target_fps_sampling_averages_frames_at_requested_rate() -> None:
     sampled = []
     for frame_index in range(882):
@@ -338,6 +352,8 @@ def test_plate_reader_selects_confident_plate_inside_violating_vehicle() -> None
         result("outside-plate", 0.99, (210, 210, 260, 230)),
         result("ab 12 cd 3456", 0.82, (40, 70, 90, 90)),
         result("low-confidence", 0.3, (50, 100, 100, 120)),
+        result("JM", 0.95, (45, 75, 70, 88)),
+        result("1234", 0.94, (48, 78, 72, 90)),
     ]
 
     recognized = select_vehicle_plates(plates, [(7, (20, 40, 180, 160))])
@@ -367,6 +383,18 @@ def test_plate_reader_matches_each_plate_to_its_vehicle() -> None:
     )
 
     assert recognized == {1: ("CAR111", 0.9), 2: ("TRK222", 0.9)}
+
+
+def test_partial_plate_fragments_are_rejected() -> None:
+    from app.detection.license_plate import is_complete_plate, normalize_plate_text
+
+    assert normalize_plate_text("JM") is None
+    assert normalize_plate_text("HR") is None
+    assert normalize_plate_text("1234") is None
+    assert normalize_plate_text("ABC") is None
+    assert normalize_plate_text("HR48E") is None
+    assert is_complete_plate("DL1RTE545")
+    assert normalize_plate_text("mh 12 ab 1234") == "MH12AB1234"
 
 
 def test_plate_reanalysis_backfills_existing_detections_and_violations(
@@ -1171,12 +1199,19 @@ def test_pipeline_flags_red_light_from_tracked_motion(client: TestClient, tmp_pa
         def load(self) -> ModelStatus:
             return self.status
 
+        def reset_tracking(self) -> None:
+            return None
+
         def predict(self, frame, frame_number: int, timestamp_sec: float) -> list[Detection]:
             y = 10 + frame_number * 12
             return [Detection(2, "car", 0.93, (30, y, 70, y + 28), frame_number, timestamp_sec)]
 
     monkeypatch.setattr(worker, "_weights_on_disk", lambda value: True)
-    monkeypatch.setattr(worker, "vehicle_engine", lambda conf, iou, imgsz=None, track_buffer=None: FakeEngine())
+    monkeypatch.setattr(
+        worker,
+        "vehicle_engine",
+        lambda conf, iou, imgsz=None, track_buffer=None, tracker_type=None: FakeEngine(),
+    )
     plate_read_calls = 0
 
     def fake_read_vehicle_plates(frame, vehicles):

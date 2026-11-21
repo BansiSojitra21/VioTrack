@@ -12,17 +12,23 @@
 
 # testing
 /coverage
+/.pytest_cache/
 
 # next.js
 /.next/
 /out/
+/.turbo/
 
 # production
 /build
+/dist
 
 # misc
 .DS_Store
+Thumbs.db
 *.pem
+.idea/
+.vscode/
 
 # debug
 npm-debug.log*

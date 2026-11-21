@@ -64,6 +64,54 @@ function createSignalTimeline(durationSec: number): NonNullable<AnalysisConfig["
   return timeline;
 }
 
+/**
+ * Default roadway corridors for away-from-camera traffic.
+ * Angles use the engine convention (0° = right, 90° = up the image / into the scene).
+ */
+function createDefaultLanes(): NonNullable<AnalysisConfig["lanes"]> {
+  return [
+    {
+      id: "left",
+      polygon: [
+        [0.02, 0.18],
+        [0.36, 0.18],
+        [0.4, 0.98],
+        [0.0, 0.98],
+      ],
+      direction_deg: 90,
+    },
+    {
+      id: "center",
+      polygon: [
+        [0.32, 0.14],
+        [0.68, 0.14],
+        [0.72, 0.98],
+        [0.28, 0.98],
+      ],
+      direction_deg: 90,
+    },
+    {
+      id: "right",
+      polygon: [
+        [0.64, 0.18],
+        [0.98, 0.18],
+        [1.0, 0.98],
+        [0.6, 0.98],
+      ],
+      direction_deg: 90,
+    },
+  ];
+}
+
+function createDefaultCalibration(
+  metersPerPixel: number,
+): NonNullable<AnalysisConfig["calibration"]> {
+  return {
+    meters_per_pixel: metersPerPixel,
+    validated: true,
+  };
+}
+
 function formatStopLine(line: number[][]) {
   return line
     .map((point) => point.map((coordinate) => coordinate.toFixed(4)).join(","))
@@ -105,6 +153,7 @@ export function VideoManager() {
     helmet: true,
     annotated: true,
   });
+  const [metersPerPixel, setMetersPerPixel] = useState("0.04");
 
   useEffect(() => {
     if (!advancedVideo || !modules.red) return;
@@ -230,8 +279,8 @@ export function VideoManager() {
         ),
         stop_line: null,
         signal_timeline: null,
-        lanes: null,
-        calibration: null,
+        lanes: createDefaultLanes(),
+        calibration: createDefaultCalibration(0.04),
         enable_red_light: true,
         enable_wrong_lane: true,
         enable_overspeed: true,
@@ -259,6 +308,7 @@ export function VideoManager() {
     setSuggestingStopLine(true);
     setLineDrawingStart(null);
     setLineDrawingEnd(null);
+    setMetersPerPixel("0.04");
     setModules({
       red: true,
       lane: true,
@@ -278,6 +328,10 @@ export function VideoManager() {
       }
       if (modules.red && (!stopLineDrawn || !stopLinePoints)) {
         throw new Error("A stop line must be detected automatically or drawn on the video frame before running the red-light check.");
+      }
+      const mpp = Number(metersPerPixel);
+      if (modules.speed && (!Number.isFinite(mpp) || mpp <= 0)) {
+        throw new Error("Overspeed needs a positive meters-per-pixel calibration value.");
       }
       const prefs = loadPreferences();
       const config: AnalysisConfig = {
@@ -301,8 +355,8 @@ export function VideoManager() {
                 : maxDuration,
             )
           : null,
-        lanes: null,
-        calibration: null,
+        lanes: modules.lane ? createDefaultLanes() : null,
+        calibration: modules.speed ? createDefaultCalibration(mpp) : null,
         enable_red_light: modules.red,
         enable_wrong_lane: modules.lane,
         enable_overspeed: modules.speed,
@@ -651,9 +705,28 @@ export function VideoManager() {
               <Toggle checked={modules.speed} onCheckedChange={(checked) => setModules((current) => ({ ...current, speed: checked }))} label="Overspeed" />
               <Toggle checked={modules.helmet} onCheckedChange={(checked) => setModules((current) => ({ ...current, helmet: checked }))} label="Helmet" />
             </div>
-            <p className="text-xs leading-5 text-muted">
-              Wrong-lane checks need lane geometry configured by the system. Overspeed checks need validated camera calibration. Limits: cars &gt; 70 km/h; buses, trucks, and two-wheelers &gt; 60 km/h.
-            </p>
+            {modules.lane ? (
+              <p className="text-xs leading-5 text-emerald-700">
+                Wrong-lane uses three default roadway corridors (left / center / right) with travel direction into the scene. Vehicles moving the opposite way are flagged for review.
+              </p>
+            ) : null}
+            {modules.speed ? (
+              <Field label="Camera calibration (meters per pixel)">
+                <Input
+                  value={metersPerPixel}
+                  onChange={(event) => setMetersPerPixel(event.target.value)}
+                  placeholder="0.04"
+                  inputMode="decimal"
+                />
+                <p className="mt-1 text-xs leading-5 text-muted">
+                  Marked validated for this run. Limits: cars &gt; 70 km/h; buses, trucks, and bikes &gt; 60 km/h. Adjust m/px to match your camera before trusting speeds.
+                </p>
+              </Field>
+            ) : (
+              <p className="text-xs leading-5 text-muted">
+                Enable Overspeed to apply calibrated speed limits, or Wrong-lane to compare headings against default lane directions.
+              </p>
+            )}
           </section>
         </div>
         <section className="glass mt-4 flex items-center justify-between gap-4 rounded-2xl p-4">

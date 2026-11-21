@@ -38,12 +38,38 @@ def license_plate_reader_available() -> bool:
     return _get_alpr() is not None
 
 
+def normalize_plate_text(raw: str | None) -> str | None:
+    """Return a cleaned plate string, or None when OCR is incomplete/partial."""
+    if not raw:
+        return None
+    text = re.sub(r"[^A-Z0-9]", "", str(raw).upper())
+    if not is_complete_plate(text):
+        return None
+    return text
+
+
+def is_complete_plate(text: str | None) -> bool:
+    """Accept only full plate reads.
+
+    Fragments such as "JM", "HR", or digits-only OCR noise are rejected so the
+    UI never shows a partial plate as if it were real.
+    """
+    if not text:
+        return False
+    cleaned = re.sub(r"[^A-Z0-9]", "", str(text).upper())
+    if len(cleaned) < 6 or len(cleaned) > 15:
+        return False
+    has_letter = any(ch.isalpha() for ch in cleaned)
+    has_digit = any(ch.isdigit() for ch in cleaned)
+    return has_letter and has_digit
+
+
 def _readable_plate(result: Any) -> tuple[str, float] | None:
     ocr = result.ocr
     if ocr is None or not ocr.text:
         return None
-    text = re.sub(r"[^A-Z0-9]", "", ocr.text.upper())
-    if not text:
+    text = normalize_plate_text(ocr.text)
+    if text is None:
         return None
     confidence = ocr.confidence
     if isinstance(confidence, list):

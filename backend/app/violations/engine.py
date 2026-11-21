@@ -264,15 +264,19 @@ def evaluate_class_violation(
                 confidence=round(detection.confidence, 4),
                 bbox=detection.bbox,
                 needs_review=uncertain or detection.confidence < 0.75,
-                rule=f"Custom {violation_type} model predicted '{detection.class_name}'.",
+                rule=(
+                    f"Custom {violation_type} model predicted '{detection.class_name}'."
+                    if detection.confidence >= 0.63
+                    else f"Possible {violation_type} (rider/person on motorcycle) for review."
+                ),
                 explanation=(
-                    f"Model predicted {detection.class_name} with confidence {detection.confidence:.2f} "
-                    f"at frame {detection.frame_number}. This is a potential violation for manual review."
+                    f"Predicted {detection.class_name} with confidence {detection.confidence:.2f} "
+                    f"at frame {detection.frame_number}. Potential violation for manual review."
                 ),
                 evidence={"predicted_class": detection.class_name, "uncertain": uncertain},
             )
         )
-    return ModuleReport(violation_type, "active", "Evaluated custom-model class predictions.", events)
+    return ModuleReport(violation_type, "active", "Evaluated helmet / no-helmet predictions.", events)
 
 
 def evaluate_helmet(detections: list[Detection], model_configured: bool, review_below: float = 0.6) -> ModuleReport:

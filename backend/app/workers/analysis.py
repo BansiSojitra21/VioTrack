@@ -17,9 +17,10 @@ import numpy as np
 from app.analytics.processor import summarize
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.detection.dedupe import suppress_duplicate_detections
 from app.detection.license_plate import read_vehicle_plates
 from app.detection.labels import VEHICLE_CLASSES
-from app.detection.types import Detection
+from app.detection.types import Detection, centroid
 from app.detection.yolo_engine import ModelUnavailableError, specialized_engine, vehicle_engine
 from app.services import repository
 from app.tracking.bytetrack import ByteTrack
@@ -235,6 +236,56 @@ def _associate_helmet_detections(
     return detections
 
 
+def _heuristic_no_helmet_detections(
+    detections: list[Detection],
+    frame_number: int,
+    timestamp_sec: float,
+) -> list[Detection]:
+    """When no helmet model is configured, flag riders as potential no-helmet
+    if a pedestrian/person box sits on the upper half of a motorcycle track.
+    These are review-only heuristics — not a substitute for HELMET_WEIGHTS.
+    """
+    motorcycles = [
+        det
+        for det in detections
+        if det.class_name == "motorcycle" and det.tracking_id is not None
+    ]
+    persons = [det for det in detections if det.class_name in {"person", "pedestrian"}]
+    if not motorcycles or not persons:
+        return []
+    flagged: list[Detection] = []
+    seen_tracks: set[int] = set()
+    for bike in motorcycles:
+        if bike.tracking_id in seen_tracks:
+            continue
+        bx1, by1, bx2, by2 = bike.bbox
+        bike_h = max(1.0, by2 - by1)
+        upper_y2 = by1 + bike_h * 0.55
+        for person in persons:
+            px, py = centroid(person.bbox)
+            if not (bx1 <= px <= bx2 and by1 <= py <= upper_y2):
+                continue
+            # Rider head/torso crops are smaller than the bike body.
+            pw = max(1.0, person.bbox[2] - person.bbox[0])
+            ph = max(1.0, person.bbox[3] - person.bbox[1])
+            if pw * ph > (bx2 - bx1) * bike_h * 0.85:
+                continue
+            seen_tracks.add(bike.tracking_id)  # type: ignore[arg-type]
+            flagged.append(
+                Detection(
+                    class_id=0,
+                    class_name="no_helmet",
+                    confidence=min(0.62, max(0.35, float(person.confidence) * 0.85)),
+                    bbox=person.bbox,
+                    frame_number=frame_number,
+                    timestamp_sec=timestamp_sec,
+                    tracking_id=bike.tracking_id,
+                )
+            )
+            break
+    return flagged
+
+
 def run_job(job_id: str) -> None:
     job = repository.get_job(job_id)
     if job is None:
@@ -429,7 +480,9 @@ def _analyze(job: dict, video: dict, config: dict) -> None:
             else engine.predict(frame, frame_index, timestamp)
         )
         inference_ms = (time.perf_counter() - inference_started) * 1000
-        tracked = tracker.update(detections, frame_index, timestamp)
+        # Drop car+truck+bike stacks on one vehicle before / after association.
+        detections = suppress_duplicate_detections(detections)
+        tracked = suppress_duplicate_detections(tracker.update(detections, frame_index, timestamp))
         if processed == 0 or (processed + 1) % 10 == 0:
             active_ids = sorted(
                 detection.tracking_id
@@ -487,6 +540,28 @@ def _analyze(job: dict, video: dict, config: dict) -> None:
             if tracking_id not in plate_by_track or plate[1] > plate_by_track[tracking_id][1]:
                 plate_by_track[tracking_id] = plate
         for det in tracked:
+            conf = float(det.confidence) if det.confidence is not None else float("nan")
+            if not math.isfinite(conf) or conf < 0.0 or conf > 1.0:
+                continue
+            # Mild pad for compact bike crops only — never invent near-full-frame boxes.
+            if det.class_name in {"motorcycle", "bicycle"}:
+                x1, y1, x2, y2 = det.bbox
+                width = max(1.0, x2 - x1)
+                height = max(1.0, y2 - y1)
+                frame_h, frame_w = frame.shape[:2]
+                area_ratio = (width * height) / max(frame_w * frame_h, 1)
+                if area_ratio > 0.045 or width / frame_w > 0.18 or height / frame_h > 0.28:
+                    continue
+                if width <= 130 and height <= 160 and height / width < 1.35:
+                    pad_top = min(height * 0.3, 40.0)
+                    pad_bottom = min(height * 0.05, 8.0)
+                    pad_x = min(width * 0.06, 10.0)
+                    det.bbox = (
+                        max(0.0, x1 - pad_x),
+                        max(0.0, y1 - pad_top),
+                        min(float(frame_w), x2 + pad_x),
+                        min(float(frame_h), y2 + pad_bottom),
+                    )
             x1, y1, x2, y2 = det.bbox
             detection_rows.append(
                 {
@@ -497,7 +572,7 @@ def _analyze(job: dict, video: dict, config: dict) -> None:
                     "timestamp_sec": timestamp,
                     "class_name": det.class_name,
                     "class_id": det.class_id,
-                    "confidence": det.confidence,
+                    "confidence": conf,
                     "x1": x1,
                     "y1": y1,
                     "x2": x2,
@@ -516,7 +591,7 @@ def _analyze(job: dict, video: dict, config: dict) -> None:
                     if det.tracking_id is not None
                     else ""
                 )
-                tag = f"{det.class_name.upper()} #{det.tracking_id} CONF {det.confidence:.0%}"
+                tag = f"{det.class_name.upper()} #{det.tracking_id} CONF {conf:.0%}"
                 if is_violator:
                     tag += " [RED LIGHT]"
                 if plate_number:
@@ -558,6 +633,11 @@ def _analyze(job: dict, video: dict, config: dict) -> None:
                 _associate_helmet_detections(
                     tracked_helmet_detections, tracked_persons_and_motorcycles
                 )
+            )
+        elif config.get("enable_helmet", True):
+            # COCO has no helmet class — use person-on-motorcycle as a review heuristic.
+            helmet_detections.extend(
+                _heuristic_no_helmet_detections(tracked, frame_index, timestamp)
             )
         if debug_input is not None and debug_dir is not None:
             stem = f"frame_{frame_index:06d}"
@@ -691,8 +771,15 @@ def _analyze(job: dict, video: dict, config: dict) -> None:
         modules.append(
             evaluate_overspeed(tracker.all_tracks, prepared.get("calibration"), conf)
         )
-    helmet_report = evaluate_helmet(helmet_detections, helmet_engine is not None)
-    if helmet_error and helmet_report.status == "not_configured":
+    helmet_model_ready = helmet_engine is not None or bool(helmet_detections)
+    helmet_report = evaluate_helmet(helmet_detections, helmet_model_ready)
+    if helmet_engine is None and helmet_detections:
+        helmet_report.message = (
+            "Helmet model not configured (set HELMET_WEIGHTS). "
+            "Used person-on-motorcycle heuristic for review-only no-helmet flags."
+        )
+        helmet_report.status = "active"
+    elif helmet_error and helmet_report.status == "not_configured":
         helmet_report.message = helmet_error or helmet_report.message
     if config.get("enable_helmet", True):
         modules.append(helmet_report)

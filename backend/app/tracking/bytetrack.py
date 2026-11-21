@@ -241,11 +241,24 @@ class ByteTrack:
         )
         track.hits += 1
         track.time_since_update = 0
+        # Soft-penalize truck votes when the track is already a car — hatchbacks
+        # are frequently double-fired as truck and should not flip the label.
+        vote = detection.confidence
+        if detection.class_name == "truck" and track.class_name == "car":
+            vote *= 0.65
+        if detection.class_name == "motorcycle" and track.class_name in {"car", "truck", "bus"}:
+            vote *= 0.45
         track.class_votes[detection.class_name] = (
-            track.class_votes.get(detection.class_name, 0.0) + detection.confidence
+            track.class_votes.get(detection.class_name, 0.0) + vote
         )
         track.class_ids[detection.class_name] = detection.class_id
-        track.class_name = max(track.class_votes, key=track.class_votes.get)
+        best = max(track.class_votes, key=track.class_votes.get)
+        current = track.class_name
+        if best != current and track.hits >= 3:
+            # Sticky class: require a clear lead before changing the display label.
+            if track.class_votes[best] < track.class_votes.get(current, 0.0) * 1.3:
+                best = current
+        track.class_name = best
         track.class_id = track.class_ids[track.class_name]
         if len(track.history) > ByteTrack.MAX_HISTORY_POINTS:
             history = track.history

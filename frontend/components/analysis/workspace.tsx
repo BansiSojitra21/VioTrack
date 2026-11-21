@@ -9,6 +9,18 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ErrorState, SampleBanner, Skeleton } from "@/components/ui/states";
 import { apiBase, apiSend, downloadApi, mediaUrl } from "@/lib/api";
+import {
+  DISPLAY_VEHICLE_CLASSES,
+  boxesAtPlayhead,
+  displayPlate,
+  groupDetections,
+  isValidBBox,
+  medianGap,
+  overlayLabel,
+  sanitizeConfidence,
+  stabilizeOverlay,
+  type StableTrackState,
+} from "@/lib/playback-boxes";
 import type { DetectionRecord, JobRecord, VideoRecord, ViolationRecord } from "@/lib/types";
 import { formatClock, titleCase } from "@/lib/utils";
 
@@ -17,8 +29,6 @@ interface Results {
   detections: DetectionRecord[];
   violations: ViolationRecord[];
 }
-
-const DISPLAY_VEHICLE_CLASSES = new Set(["car", "motorcycle", "bus", "truck", "bicycle"]);
 
 function ccw(p1: [number, number], p2: [number, number], p3: [number, number]): boolean {
   return (p3[1] - p1[1]) * (p2[0] - p1[0]) > (p2[1] - p1[1]) * (p3[0] - p1[0]);
@@ -33,15 +43,6 @@ function segmentsIntersect(
   return ccw(a1, b1, b2) !== ccw(a2, b1, b2) && ccw(a1, a2, b1) !== ccw(a1, a2, b2);
 }
 
-function detectionIoU(a: number[], b: number[]): number {
-  const width = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0]));
-  const height = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
-  const intersection = width * height;
-  const areaA = Math.max(0, a[2] - a[0]) * Math.max(0, a[3] - a[1]);
-  const areaB = Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
-  return intersection / Math.max(areaA + areaB - intersection, 1);
-}
-
 interface PlaybackDetection {
   class_name: string;
   class_id?: number;
@@ -49,97 +50,6 @@ interface PlaybackDetection {
   bbox: number[];
   tracking_id?: number | null;
   track_id?: number | null;
-}
-
-function groupDetections(items: DetectionRecord[]) {
-  const ordered = [...items].sort((a, b) => a.timestamp_sec - b.timestamp_sec);
-  const byTrack = new Map<number, DetectionRecord[]>();
-  const untracked: DetectionRecord[] = [];
-  for (const detection of ordered) {
-    if (!DISPLAY_VEHICLE_CLASSES.has(detection.class_name)) continue;
-    if (detection.tracking_id == null) {
-      untracked.push(detection);
-      continue;
-    }
-    const track = byTrack.get(detection.tracking_id);
-    if (track) track.push(detection);
-    else byTrack.set(detection.tracking_id, [detection]);
-  }
-  return { byTrack, untracked };
-}
-
-function medianGap(byTrack: Map<number, DetectionRecord[]>) {
-  const gaps: number[] = [];
-  for (const trackDetections of byTrack.values()) {
-    for (let index = 1; index < trackDetections.length; index += 1) {
-      const gap = trackDetections[index].timestamp_sec - trackDetections[index - 1].timestamp_sec;
-      if (gap > 0 && gap < 10) gaps.push(gap);
-    }
-  }
-  if (gaps.length === 0) return 0.5;
-  gaps.sort((a, b) => a - b);
-  return gaps[Math.floor(gaps.length / 2)];
-}
-
-function boxesAtPlayhead(
-  byTrack: Map<number, DetectionRecord[]>,
-  untracked: DetectionRecord[],
-  time: number,
-  detectionGap: number,
-  minConfidence: number,
-) {
-  const maxSnapWindow = Math.min(0.35, Math.max(0.08, detectionGap * 0.75));
-  const maxInterpolationGap = Math.min(1.5, Math.max(0.35, detectionGap * 2.5));
-  const active: DetectionRecord[] = [];
-
-  for (const trackDetections of byTrack.values()) {
-    let lo = 0;
-    let hi = trackDetections.length;
-    while (lo < hi) {
-      const mid = Math.floor((lo + hi) / 2);
-      if (trackDetections[mid].timestamp_sec < time) lo = mid + 1;
-      else hi = mid;
-    }
-
-    const before = lo > 0 ? trackDetections[lo - 1] : null;
-    const after = lo < trackDetections.length ? trackDetections[lo] : null;
-    if (before && after && after.timestamp_sec - before.timestamp_sec <= maxInterpolationGap) {
-      const span = after.timestamp_sec - before.timestamp_sec;
-      if (span <= 0.0001) {
-        if (after.confidence >= minConfidence) active.push(after);
-        continue;
-      }
-      const progress = Math.max(0, Math.min(1, (time - before.timestamp_sec) / span));
-      const interpolated: DetectionRecord = {
-        ...before,
-        timestamp_sec: time,
-        bbox: before.bbox.map((coord, index) => coord + (after.bbox[index] - coord) * progress),
-      };
-      if (interpolated.confidence >= minConfidence) active.push(interpolated);
-      continue;
-    }
-
-    const nearest =
-      before && after
-        ? time - before.timestamp_sec < after.timestamp_sec - time
-          ? before
-          : after
-        : (before ?? after);
-    if (
-      nearest &&
-      nearest.confidence >= minConfidence &&
-      Math.abs(nearest.timestamp_sec - time) <= maxSnapWindow
-    ) {
-      active.push(nearest);
-    }
-  }
-
-  for (const detection of untracked) {
-    if (detection.confidence >= minConfidence && Math.abs(detection.timestamp_sec - time) <= maxSnapWindow) {
-      active.push(detection);
-    }
-  }
-  return active;
 }
 
 export function AnalysisWorkspace({ jobId }: { jobId: string }) {
@@ -150,6 +60,8 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   const previewedDuringAnalysisRef = useRef(false);
   const replayWithDetectionsStartedRef = useRef(false);
   const liveTracksRef = useRef<Map<number, DetectionRecord[]>>(new Map());
+  const stableTracksRef = useRef<Map<number, StableTrackState>>(new Map());
+  const savedOverlayLatchRef = useRef(false);
   const captureBusyRef = useRef(false);
   const lastCaptureAtRef = useRef(-1);
   const sessionGenRef = useRef(0);
@@ -181,6 +93,8 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
     previewedDuringAnalysisRef.current = false;
     replayWithDetectionsStartedRef.current = false;
     liveTracksRef.current = new Map();
+    stableTracksRef.current = new Map();
+    savedOverlayLatchRef.current = false;
     captureBusyRef.current = false;
     lastCaptureAtRef.current = -1;
     sessionGenRef.current += 1;
@@ -422,31 +336,65 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   }, [overlayDetections, viewViolations, viewJob?.config, viewVideo]);
 
   const effectiveNow = now;
-  const useSavedTracks =
+  const analysisActive =
+    viewJob?.status === "pending" || viewJob?.status === "processing";
+  // While analysis is running, always draw from live YOLO so boxes appear
+  // immediately — do not wait for the worker to pass each playhead frame.
+  // After the job finishes, use saved tracks (with hysteresis near the watermark).
+  if (analysisActive) {
+    savedOverlayLatchRef.current = false;
+  } else if (
     data?.source === "sample" ||
     viewJob?.status === "completed" ||
     viewJob?.status === "cancelled" ||
-    viewJob?.status === "failed" ||
-    (storedUntil >= 0 && effectiveNow <= storedUntil + 0.25);
+    viewJob?.status === "failed"
+  ) {
+    savedOverlayLatchRef.current = true;
+  } else if (storedUntil >= 0 && effectiveNow <= storedUntil + 0.25) {
+    savedOverlayLatchRef.current = true;
+  } else if (storedUntil < 0 || effectiveNow > storedUntil + 0.55) {
+    savedOverlayLatchRef.current = false;
+  }
+  const useSavedTracks = savedOverlayLatchRef.current;
+  const overlayModeRef = useRef(useSavedTracks);
+  if (overlayModeRef.current !== useSavedTracks) {
+    // Keep existing visible tracks during handoff so boxes do not blink off.
+    overlayModeRef.current = useSavedTracks;
+  }
 
   const visible = useMemo(() => {
-    const displayThreshold = viewJob?.config?.conf ?? 0.25;
-    if (useSavedTracks) {
-      return boxesAtPlayhead(
-        detectionsByTrack.byTrack,
-        detectionsByTrack.untracked,
-        effectiveNow,
-        detectionGap,
-        displayThreshold,
-      );
-    }
-    return boxesAtPlayhead(
+    // Keep detection recall reasonably high; the stabilizer rejects one-frame FPs.
+    const displayThreshold = useSavedTracks
+      ? (viewJob?.config?.conf ?? 0.25)
+      : Math.max(viewJob?.config?.conf ?? 0.25, 0.28);
+    const liveRaw = boxesAtPlayhead(
       liveGrouped.byTrack,
       liveGrouped.untracked,
       effectiveNow,
-      liveGap,
+      Math.max(liveGap, 0.12),
       displayThreshold,
     );
+    const savedRaw = boxesAtPlayhead(
+      detectionsByTrack.byTrack,
+      detectionsByTrack.untracked,
+      effectiveNow,
+      detectionGap,
+      displayThreshold,
+    );
+    // During analysis prefer live; if a live round is still in flight, fall back to
+    // any saved rows that already arrived so the overlay is never blank.
+    const raw = useSavedTracks ? savedRaw : liveRaw.length > 0 ? liveRaw : savedRaw;
+    const stabilized = stabilizeOverlay(stableTracksRef.current, raw, effectiveNow, {
+      persistSec: useSavedTracks ? 0.55 : 0.7,
+      alpha: 0.8,
+      // Show the first live hit immediately (was 2 → boxes lagged until a 2nd frame).
+      confirmHits: 1,
+      minDisplayConf: 0.35,
+      frameW: viewVideo?.width ?? 0,
+      frameH: viewVideo?.height ?? 0,
+    });
+    stableTracksRef.current = stabilized.state;
+    return stabilized.boxes;
   }, [
     detectionGap,
     detectionsByTrack,
@@ -455,13 +403,17 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
     liveGrouped,
     useSavedTracks,
     viewJob?.config?.conf,
+    viewVideo?.height,
+    viewVideo?.width,
   ]);
 
-  const tracks = useSavedTracks ? detectionsByTrack.byTrack.size : Math.max(liveGrouped.byTrack.size, detectionsByTrack.byTrack.size);
+  const tracks = useSavedTracks
+    ? detectionsByTrack.byTrack.size
+    : Math.max(liveGrouped.byTrack.size, detectionsByTrack.byTrack.size);
 
   useEffect(() => {
     const active = viewJob?.status === "pending" || viewJob?.status === "processing";
-    if (!isVideoPlaying || !active || data?.source === "sample" || !apiBase()) return;
+    if (!active || data?.source === "sample" || !apiBase()) return;
 
     let stopped = false;
     let timer = 0;
@@ -475,30 +427,40 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       if (stopped) return;
       const videoEl = videoRef.current;
       const status = jobStatusRef.current;
-      if (!videoEl || videoEl.paused || videoEl.ended) return;
-      if (status !== "pending" && status !== "processing") return;
-      const time = videoEl.currentTime;
-      const coveredUntil = detectionsRef.current.reduce((max, item) => Math.max(max, item.timestamp_sec), -1);
-      if (coveredUntil >= 0 && time <= coveredUntil + 0.25) {
-        schedule(200);
+      if (!videoEl || videoEl.ended) {
+        if (!stopped) schedule(250);
         return;
       }
-      const captureIsCurrent = lastCaptureAtRef.current >= 0 && time >= lastCaptureAtRef.current;
+      if (status !== "pending" && status !== "processing") return;
+      const time = videoEl.currentTime;
+      // Always score live frames while the job is running so the overlay does not
+      // wait for the background worker to process the current playhead.
+      const coveredUntil = detectionsRef.current.reduce((max, item) => Math.max(max, item.timestamp_sec), -1);
+      const needsLive =
+        status === "pending" ||
+        status === "processing" ||
+        coveredUntil < 0 ||
+        time > coveredUntil + 0.2;
+      if (!needsLive) {
+        schedule(isVideoPlaying ? 200 : 400);
+        return;
+      }
+      const minInterval = videoEl.paused ? 0.12 : 0.04;
       if (
         captureBusyRef.current ||
-        (captureIsCurrent && time - lastCaptureAtRef.current < 0.3)
+        (lastCaptureAtRef.current >= 0 && Math.abs(time - lastCaptureAtRef.current) < minInterval)
       ) {
-        schedule(80);
+        schedule(videoEl.paused ? 180 : 40);
         return;
       }
       if (!videoEl.videoWidth || !videoEl.videoHeight) {
         schedule(200);
         return;
       }
-      if (lastCaptureAtRef.current >= 0 && Math.abs(time - lastCaptureAtRef.current) > 1.2) {
+      if (lastCaptureAtRef.current >= 0 && Math.abs(time - lastCaptureAtRef.current) > 1.8) {
         sessionGenRef.current += 1;
         liveTracksRef.current = new Map();
-        setLiveDetections([]);
+        // Keep stable overlay state so boxes do not vanish on seek recovery.
       }
 
       const canvas = document.createElement("canvas");
@@ -525,7 +487,8 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       }
       const body = new FormData();
       body.append("file", blob, "frame.jpg");
-      body.append("conf", String(viewJob?.config?.conf ?? 0.25));
+      // Lower model conf for recall; frontend confirmation + minDisplayConf remove ghosts.
+      body.append("conf", String(Math.max(viewJob?.config?.conf ?? 0.25, 0.25)));
       body.append("iou", String(viewJob?.config?.iou ?? 0.5));
       body.append("session_id", `playback-${jobId}-${sessionGenRef.current}`);
       const mediaFps = viewVideo?.fps || 25;
@@ -537,10 +500,14 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
         const playhead = videoRef.current?.currentTime ?? time;
         if (Math.abs(playhead - time) > 0.8) return;
         if (jobStatusRef.current !== "pending" && jobStatusRef.current !== "processing") return;
-        const trackMap = liveTracksRef.current;
+        const previous = liveTracksRef.current;
+        const nextMap = new Map<number, DetectionRecord[]>();
         for (const item of result.items) {
           const trackId = item.tracking_id ?? item.track_id;
           if (trackId == null || !DISPLAY_VEHICLE_CLASSES.has(item.class_name)) continue;
+          const confidence = sanitizeConfidence(item.confidence);
+          if (confidence == null || confidence < 0.25) continue;
+          if (!isValidBBox(item.bbox)) continue;
           const record: DetectionRecord = {
             id: `live-${sessionGenRef.current}-${trackId}-${time.toFixed(3)}`,
             job_id: jobId,
@@ -549,18 +516,28 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
             timestamp_sec: time,
             class_name: item.class_name,
             class_id: item.class_id ?? 0,
-            confidence: item.confidence,
+            confidence,
             bbox: item.bbox,
             tracking_id: -Math.abs(trackId),
             plate_number: null,
             sample: false,
           };
-          const points = trackMap.get(trackId) ?? [];
-          points.push(record);
-          if (points.length > 24) points.shift();
-          trackMap.set(trackId, points);
+          const history = previous.get(trackId) ?? [];
+          const last = history[history.length - 1];
+          const points =
+            last && Math.abs(last.timestamp_sec - time) < 0.05
+              ? [...history.slice(0, -1), record]
+              : [...history, record];
+          nextMap.set(trackId, points.slice(-8));
         }
-        setLiveDetections([...trackMap.values()].flat());
+        // Keep missing tracks for ~0.7s so boxes stay continuous between live API rounds.
+        for (const [trackId, points] of previous.entries()) {
+          if (nextMap.has(trackId)) continue;
+          const last = points[points.length - 1];
+          if (last && time - last.timestamp_sec <= 0.7) nextMap.set(trackId, points.slice(-8));
+        }
+        liveTracksRef.current = nextMap;
+        setLiveDetections([...nextMap.values()].flat());
       } catch {
         if (!captureNoticeRef.current) {
           captureNoticeRef.current = true;
@@ -568,11 +545,12 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
         }
       } finally {
         captureBusyRef.current = false;
-        if (!stopped) schedule(40);
+        if (!stopped) schedule(videoEl.paused ? 120 : 30);
       }
     };
 
-    schedule(150);
+    // Fire immediately so the first paint after opening the workspace gets boxes.
+    schedule(0);
     return () => {
       stopped = true;
       window.clearTimeout(timer);
@@ -599,8 +577,11 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       requestAnimationFrame(() => draw());
       return;
     }
-    canvas.width = width;
-    canvas.height = height;
+    // Only resize when needed — resetting width/height every frame causes flicker.
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
     const context = canvas.getContext("2d");
     if (!context) return;
     context.clearRect(0, 0, width, height);
@@ -696,6 +677,35 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       context.restore();
     }
 
+    // ── Lane corridors (wrong-lane geometry) ───────────────────────────────────
+    if (job?.config?.enable_wrong_lane !== false && job?.config?.lanes?.length) {
+      context.save();
+      context.setLineDash([6, 5]);
+      context.lineWidth = 2;
+      context.strokeStyle = "rgba(14, 165, 233, 0.75)";
+      context.fillStyle = "rgba(14, 165, 233, 0.08)";
+      for (const lane of job.config.lanes) {
+        if (!lane.polygon || lane.polygon.length < 3) continue;
+        context.beginPath();
+        lane.polygon.forEach((point, index) => {
+          const px = point[0] <= 1 ? point[0] * vw : point[0];
+          const py = point[1] <= 1 ? point[1] * vh : point[1];
+          const x = offsetX + px * sx;
+          const y = offsetY + py * sy;
+          if (index === 0) context.moveTo(x, y);
+          else context.lineTo(x, y);
+        });
+        context.closePath();
+        context.fill();
+        context.stroke();
+      }
+      context.setLineDash([]);
+      context.fillStyle = "rgba(14, 165, 233, 0.95)";
+      context.font = "bold 11px sans-serif";
+      context.fillText("LANES (wrong-lane check)", offsetX + 10, Math.min(offsetY + 16, contentBottom - 4));
+      context.restore();
+    }
+
     // ── Vehicle bounding boxes ─────────────────────────────────────────────────
     context.save();
     context.beginPath();
@@ -703,11 +713,15 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
     context.clip();
     const placedLabels: { x: number; y: number; width: number; height: number }[] = [];
     for (const detection of visible) {
+      if (!isValidBBox(detection.bbox, vw, vh)) continue;
+      if (sanitizeConfidence(detection.confidence) == null) continue;
       const [x1, y1, x2, y2] = detection.bbox;
       const boxX = offsetX + x1 * sx;
       const boxY = offsetY + y1 * sy;
       const boxWidth = (x2 - x1) * sx;
       const boxHeight = (y2 - y1) * sy;
+      if (![boxX, boxY, boxWidth, boxHeight].every((value) => Number.isFinite(value))) continue;
+      if (boxWidth < 4 || boxHeight < 4) continue;
       const violationAt = detection.tracking_id == null
         ? undefined
         : redLightViolationTimes.get(detection.tracking_id);
@@ -722,22 +736,10 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       context.strokeRect(boxX, boxY, boxWidth, boxHeight);
       context.shadowBlur = 0;
 
-      const label = [
-        detection.class_name.toUpperCase(),
-        detection.tracking_id != null
-          ? detection.tracking_id < 0
-            ? `LIVE #${Math.abs(detection.tracking_id)}`
-            : `#${detection.tracking_id}`
-          : "",
-        isViolator ? "⚠ VIOLATION" : "",
-        `CONF ${Math.round(detection.confidence * 100)}%`,
-      ]
-        .filter(Boolean)
-        .join(" ");
+      const { primary: label, plate } = overlayLabel(detection);
 
       const labelFont = "bold 12px sans-serif";
       context.font = labelFont;
-      const plate = detection.plate_number ? `PLATE: ${detection.plate_number}` : null;
       const textWidth = context.measureText(label).width;
       const plateFont = "bold 12px monospace";
       context.font = plateFont;
@@ -922,6 +924,9 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
                 }}
                 onSeeked={(event) => {
                   const time = event.currentTarget.currentTime;
+                  if (Math.abs(time - now) > 0.45) {
+                    stableTracksRef.current = new Map();
+                  }
                   if (lastCaptureAtRef.current < 0 || Math.abs(time - lastCaptureAtRef.current) > 0.8) {
                     sessionGenRef.current += 1;
                     liveTracksRef.current = new Map();
@@ -953,7 +958,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
           </div>
           {viewJob.status === "processing" || viewJob.status === "pending" ? (
             <p className="px-1 text-xs text-muted">
-              The video plays from start to finish on its own. Until the background job reaches the playhead, boxes come from a separate YOLO pass on the frame you are watching, and each vehicle keeps that live track. The job keeps storing the full timeline, plates, and violations. Once it catches up, the overlay follows those saved tracks through the rest of the clip.
+              Boxes follow each vehicle continuously (track ID, confidence, plate). While analysis is still catching up, a live YOLO pass fills ahead of the saved timeline; afterward the overlay uses the stored tracks.
             </p>
           ) : viewJob.status === "failed" && viewJob.frames_processed < viewJob.frames_total ? (
             <p className="px-1 text-xs text-amber-700">
@@ -970,13 +975,19 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
             {visible.length === 0 ? (
               <li className="text-sm text-muted">
                 {viewJob.status === "processing" || viewJob.status === "pending"
-                  ? "Scoring this moment separately from the background analysis. A box appears as soon as that frame returns, then follows the vehicle."
-                  : "No vehicle detections are stored near this timestamp."}
+                  ? "Waiting for live boxes for this playhead…"
+                  : "No tracked vehicles near this time."}
               </li>
             ) : null}
             {visible.map((item) => {
               const violationAt = item.tracking_id == null ? undefined : redLightViolationTimes.get(item.tracking_id);
               const isViolator = violationAt != null && now >= violationAt;
+              const trackId =
+                item.tracking_id == null
+                  ? "—"
+                  : item.tracking_id < 0
+                    ? Math.abs(item.tracking_id)
+                    : item.tracking_id;
               return (
                 <li
                   key={item.id}
@@ -986,20 +997,17 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
                 >
                   <div className="flex items-center justify-between">
                     <span className={`font-semibold ${isViolator ? "text-rose-700" : "text-emerald-700"}`}>
-                      {titleCase(item.class_name)}
+                      {titleCase(item.class_name === "motorcycle" ? "bike" : item.class_name)} #{trackId} ·{" "}
+                      {Math.round(item.confidence * 100)}%
                     </span>
                     {isViolator ? (
-                      <Badge tone="rose">RED LIGHT VIOLATION</Badge>
+                      <Badge tone="rose">RED LIGHT</Badge>
                     ) : (
-                      <Badge tone="green">COMPLIANT</Badge>
+                      <Badge tone="green">OK</Badge>
                     )}
                   </div>
-                  <p className="mt-1 text-xs text-muted">
-                    Track {item.tracking_id == null ? "—" : item.tracking_id < 0 ? "Live" : item.tracking_id} ·{" "}
-                    {Math.round(item.confidence * 100)}% confidence · frame {item.frame_number}
-                  </p>
                   <p className={`mt-1 font-mono text-xs font-semibold ${isViolator ? "text-rose-900" : "text-slate-800"}`}>
-                    Plate: {item.plate_number || "Not recognized"}
+                    Plate: {displayPlate(item.plate_number) || "—"}
                   </p>
                 </li>
               );

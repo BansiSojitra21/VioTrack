@@ -15,7 +15,9 @@ from fastapi.responses import FileResponse, Response
 from app.analytics.processor import most_common_violation, summarize, traffic_series
 from app.core.config import settings
 from app.detection.labels import VEHICLE_CLASSES
-from app.detection.types import Detection, iou as bbox_iou
+from app.detection.license_plate import normalize_plate_text
+from app.detection.dedupe import suppress_duplicate_detections as _suppress_duplicate_frame_detections
+from app.detection.types import Detection
 from app.schemas.models import ReviewUpdate, StartAnalysis
 from app.services import repository, storage
 from app.services.model_card import model_info
@@ -383,16 +385,18 @@ async def detect_frame(
     detections = _suppress_duplicate_frame_detections(
         [det for det in detections if det.class_name in VEHICLE_CLASSES]
     )
+    frame_h, frame_w = int(image.shape[0]), int(image.shape[1])
+    detections = _filter_playback_detections(detections, frame_w, frame_h)
     if session_id:
         tracker = _playback_trackers.get(session_id)
         if tracker is None:
             if len(_playback_trackers) >= 32:
                 _playback_trackers.pop(next(iter(_playback_trackers)))
             tracker = ByteTrack(
-                high_thresh=float(conf),
-                low_thresh=min(float(conf), 0.1),
-                match_iou=0.12,
-                max_age=12,
+                high_thresh=max(float(conf), 0.28),
+                low_thresh=max(min(float(conf), 0.18), 0.12),
+                match_iou=0.3,
+                max_age=8,
             )
             _playback_trackers[session_id] = tracker
         detections = tracker.update(
@@ -400,15 +404,17 @@ async def detect_frame(
             max(0, int(frame_number)),
             max(0.0, float(timestamp_sec)),
         )
-    return {
-        "sample": False,
-        "width": int(image.shape[1]),
-        "height": int(image.shape[0]),
-        "items": [
+        detections = _suppress_duplicate_frame_detections(detections)
+        detections = _filter_playback_detections(detections, frame_w, frame_h)
+    items = []
+    for det in detections:
+        if not _finite_confidence(det.confidence):
+            continue
+        items.append(
             {
                 "class_name": det.class_name,
                 "class_id": det.class_id,
-                "confidence": det.confidence,
+                "confidence": float(det.confidence),
                 "bbox": list(det.bbox),
                 "frame_number": max(0, int(frame_number)),
                 "frame_index": max(0, int(frame_number)),
@@ -418,19 +424,111 @@ async def detect_frame(
                 "track_id": det.tracking_id,
                 "sample": False,
             }
-            for det in detections
-        ],
+        )
+    return {
+        "sample": False,
+        "width": frame_w,
+        "height": frame_h,
+        "items": items,
     }
 
 
-def _suppress_duplicate_frame_detections(detections: list[Detection]) -> list[Detection]:
+def _finite_confidence(value: float) -> bool:
+    try:
+        conf = float(value)
+    except (TypeError, ValueError):
+        return False
+    return conf == conf and conf not in (float("inf"), float("-inf")) and 0.0 <= conf <= 1.0
+
+
+_TWO_WHEELER_CLASSES = {"motorcycle", "bicycle"}
+
+
+def _is_oversized_vehicle_box(
+    bbox: tuple[float, float, float, float],
+    class_name: str,
+    frame_w: int,
+    frame_h: int,
+) -> bool:
+    if frame_w <= 0 or frame_h <= 0:
+        return False
+    width = max(0.0, bbox[2] - bbox[0])
+    height = max(0.0, bbox[3] - bbox[1])
+    area_ratio = (width * height) / max(frame_w * frame_h, 1)
+    if class_name in _TWO_WHEELER_CLASSES:
+        return area_ratio > 0.045 or width / frame_w > 0.18 or height / frame_h > 0.28
+    return area_ratio > 0.2 or width / frame_w > 0.5 or height / frame_h > 0.65
+
+
+def _expand_two_wheeler_bbox(
+    detection: Detection,
+    frame_w: int,
+    frame_h: int,
+) -> Detection | None:
+    """Mild upward pad for compact bike crops only — never invent full-frame boxes."""
+    if detection.class_name not in _TWO_WHEELER_CLASSES:
+        return detection
+    if _is_oversized_vehicle_box(detection.bbox, detection.class_name, frame_w, frame_h):
+        return None
+    x1, y1, x2, y2 = detection.bbox
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+    if width > 130 or height > 160 or height / width >= 1.35:
+        return detection
+    pad_top = min(height * 0.3, 40.0)
+    pad_bottom = min(height * 0.05, 8.0)
+    pad_x = min(width * 0.06, 10.0)
+    nx1 = max(0.0, x1 - pad_x)
+    ny1 = max(0.0, y1 - pad_top)
+    nx2 = min(float(frame_w), x2 + pad_x) if frame_w > 0 else x2 + pad_x
+    ny2 = min(float(frame_h), y2 + pad_bottom) if frame_h > 0 else y2 + pad_bottom
+    if nx2 - nx1 < 8 or ny2 - ny1 < 8:
+        return detection
+    expanded = (nx1, ny1, nx2, ny2)
+    if _is_oversized_vehicle_box(expanded, detection.class_name, frame_w, frame_h):
+        return detection
+    detection.bbox = expanded
+    return detection
+
+
+def _filter_playback_detections(
+    detections: list[Detection],
+    frame_w: int,
+    frame_h: int,
+) -> list[Detection]:
+    """Drop empty-road / foliage / oversized hallucinations; keep small distant vehicles."""
+    frame_area = max(frame_w * frame_h, 1)
     kept: list[Detection] = []
-    for detection in sorted(detections, key=lambda item: item.confidence, reverse=True):
-        if any(
-            detection.class_name != previous.class_name
-            and bbox_iou(detection.bbox, previous.bbox) >= 0.85
-            for previous in kept
-        ):
+    for detection in detections:
+        if not _finite_confidence(detection.confidence):
+            continue
+        if _is_oversized_vehicle_box(detection.bbox, detection.class_name, frame_w, frame_h):
+            continue
+        expanded = _expand_two_wheeler_bbox(detection, frame_w, frame_h)
+        if expanded is None:
+            continue
+        detection = expanded
+        x1, y1, x2, y2 = detection.bbox
+        width = max(0.0, x2 - x1)
+        height = max(0.0, y2 - y1)
+        area = width * height
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        if width < 8 or height < 8:
+            continue
+        if area / frame_area > 0.22:
+            continue
+        if width / max(frame_w, 1) > 0.42 or height / max(frame_h, 1) > 0.55:
+            continue
+        aspect = width / max(height, 1.0)
+        if aspect > 3.8 or aspect < 0.2:
+            continue
+        # One-frame foliage FPs often sit on the roadside canopy (upper sides).
+        roadside = cx < frame_w * 0.12 or cx > frame_w * 0.88
+        canopy = cy < frame_h * 0.42
+        if roadside and canopy and detection.confidence < 0.55:
+            continue
+        if detection.confidence < 0.28:
             continue
         kept.append(detection)
     return kept
@@ -644,9 +742,17 @@ def _detection_payload(row: dict) -> dict:
         "bbox": [row["x1"], row["y1"], row["x2"], row["y2"]],
         "tracking_id": row["tracking_id"],
         "track_id": row["tracking_id"],
-        "plate_number": row.get("plate_number"),
+        "plate_number": normalize_plate_text(row.get("plate_number")),
         "sample": False,
     }
+
+
+def _sanitize_evidence(evidence: Any) -> Any:
+    if not isinstance(evidence, dict):
+        return evidence
+    cleaned = dict(evidence)
+    cleaned["plate_number"] = normalize_plate_text(cleaned.get("plate_number"))
+    return cleaned
 
 
 def _violation_payload(row: dict, video: dict | None = None) -> dict:
@@ -662,7 +768,7 @@ def _violation_payload(row: dict, video: dict | None = None) -> dict:
         "frame_number": row["frame_number"],
         "confidence": row["confidence"],
         "review_status": row["review_status"],
-        "evidence": row["evidence"],
+        "evidence": _sanitize_evidence(row["evidence"]),
         "created_at": row["created_at"],
         "sample": False,
     }

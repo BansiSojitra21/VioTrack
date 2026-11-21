@@ -21,8 +21,13 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`} data-accent="violet">
-      <body className="min-h-full">
+    <html
+      lang="en"
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      data-accent="violet"
+      suppressHydrationWarning
+    >
+      <body className="min-h-full" suppressHydrationWarning>
         <Suspense fallback={<div className="p-8 text-sm text-slate-500">Loading VioTrack…</div>}>
           <Providers>{children}</Providers>
         </Suspense>
