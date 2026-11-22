@@ -14,7 +14,7 @@ import {
   Tooltip,
   XAxis,
   YAxis,
-} from "recharts";
+} from "recharts";  
 import type { Summary, TrafficSeries } from "@/lib/types";
 import { classColor, titleCase } from "@/lib/utils";
 

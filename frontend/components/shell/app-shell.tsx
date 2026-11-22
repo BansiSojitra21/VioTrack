@@ -103,18 +103,23 @@ export function PageHeader({
   kicker,
   title,
   description,
+  titleAction,
   actions,
 }: {
   kicker: string;
   title: string;
   description: string;
+  titleAction?: React.ReactNode;
   actions?: React.ReactNode;
 }) {
   return (
     <div className="mb-6 flex flex-col justify-between gap-4 md:flex-row md:items-end">
       <div>
         <p className="text-xs uppercase tracking-[0.18em] text-cyan-700">{kicker}</p>
-        <h1 className="mt-1 text-3xl font-semibold tracking-tight">{title}</h1>
+        <div className="mt-1 flex flex-wrap items-center gap-3">
+          <h1 className="text-3xl font-semibold tracking-tight">{title}</h1>
+          {titleAction}
+        </div>
         <p className="mt-2 max-w-3xl text-sm leading-6 text-muted">{description}</p>
       </div>
       {actions}

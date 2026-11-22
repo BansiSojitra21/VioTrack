@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
+import { History } from "lucide-react";
 import { toast } from "sonner";
 import { useTrafficData } from "@/components/providers/data-provider";
 import { PageHeader } from "@/components/shell/app-shell";
@@ -146,6 +147,7 @@ export function VideoManager() {
   const [drawingStopLine, setDrawingStopLine] = useState(false);
   const [lineDrawingStart, setLineDrawingStart] = useState<[number, number] | null>(null);
   const [lineDrawingEnd, setLineDrawingEnd] = useState<[number, number] | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [modules, setModules] = useState({
     red: true,
     lane: true,
@@ -423,6 +425,23 @@ export function VideoManager() {
         kicker="Library"
         title="Video management"
         description={`Upload MP4, AVI, MOV, or WebM up to ${maxMb} MB and ${maxDuration} seconds. All violation checks are enabled by default; configure camera-specific evidence for red-light, wrong-lane, and speed checks.`}
+        actions={
+          <div className="mt-2 self-start">
+            <Button
+              variant="secondary"
+              onClick={() => setHistoryOpen((open) => !open)}
+              aria-expanded={historyOpen}
+            >
+              <History size={16} aria-hidden="true" />
+              Analysis history
+              {data.history.length > 0 ? (
+                <span className="rounded-full bg-violet-50 px-2 py-0.5 text-xs font-semibold text-violet-700">
+                  {data.history.length}
+                </span>
+              ) : null}
+            </Button>
+          </div>
+        }
       />
       {data.source === "sample" && data.notice ? <SampleBanner text={data.notice} /> : null}
       <label
@@ -537,13 +556,22 @@ export function VideoManager() {
           })}
         </div>
       )}
-      <section className="glass rounded-2xl p-5">
-        <h2 className="text-xl font-semibold">Analysis history</h2>
-        <p className="mt-1 text-sm text-muted">Open previous analyses or download their violation CSV and PDF reports.</p>
-        <div className="mt-4 space-y-3">
+      <Modal
+        open={historyOpen}
+        onOpenChange={setHistoryOpen}
+        title="Analysis history"
+        description="Open previous analyses or download their violation CSV and PDF reports."
+      >
+        <div className="space-y-4">
+          <div className="flex justify-end">
+            <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+              {data.history.length} {data.history.length === 1 ? "analysis" : "analyses"}
+            </span>
+          </div>
+          <div className="mt-4 space-y-3">
           {data.history.length === 0 ? <p className="text-sm text-muted">No completed analyses yet.</p> : null}
           {data.history.map((item) => (
-            <article key={item.job_id} className="rounded-xl border border-slate-200 p-4">
+            <article key={item.job_id} className="rounded-xl border border-slate-200 bg-white/60 p-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h3 className="font-medium">{item.video_name}</h3>
@@ -562,8 +590,9 @@ export function VideoManager() {
               </dl>
             </article>
           ))}
+          </div>
         </div>
-      </section>
+      </Modal>
       <Modal
         open={Boolean(advancedVideo)}
         onOpenChange={(open) => {
