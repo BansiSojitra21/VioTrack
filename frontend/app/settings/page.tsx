@@ -1,7 +1,6 @@
-"use client";
+import { redirect } from "next/navigation";
 
-import { SettingsView } from "@/components/settings/settings-view";
-
-export default function Page() {
-  return <SettingsView />;
+/** Settings UI removed — YOLO/analysis values are fixed defaults. */
+export default function SettingsPage() {
+  redirect("/");
 }

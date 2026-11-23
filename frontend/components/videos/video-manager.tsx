@@ -14,7 +14,7 @@ import { Modal } from "@/components/ui/modal";
 import { Toggle } from "@/components/ui/controls";
 import { EmptyState, ErrorState, SampleBanner, Skeleton } from "@/components/ui/states";
 import { apiBase, apiSend, downloadApi, mediaUrl, startAnalysis } from "@/lib/api";
-import { loadPreferences } from "@/lib/settings";
+import { defaultPreferences } from "@/lib/settings";
 import type { AnalysisConfig, VideoRecord } from "@/lib/types";
 import { formatBytes, formatClock, formatWhen } from "@/lib/utils";
 
@@ -264,14 +264,14 @@ export function VideoManager() {
       return;
     }
     setAnalyzingVideo(video.id);
-    const prefs = loadPreferences();
+    const prefs = defaultPreferences;
     try {
       const defaults: AnalysisConfig = {
         conf: prefs.conf,
         iou: prefs.iou,
         imgsz: prefs.imgsz,
         track_buffer: prefs.trackBuffer,
-        tracker_type: prefs.trackerType ?? "bytetrack",
+        tracker_type: prefs.trackerType,
         debug_mode: prefs.debugMode,
         frame_stride: prefs.frameStride,
         target_fps: prefs.targetFps,
@@ -302,7 +302,6 @@ export function VideoManager() {
   }
 
   function configureAnalysis(video: VideoRecord) {
-    const prefs = loadPreferences();
     setStopLine("");
     setStopLineDrawn(false);
     setStopLineSuggestion(null);
@@ -316,7 +315,7 @@ export function VideoManager() {
       lane: true,
       speed: true,
       helmet: true,
-      annotated: prefs.saveAnnotated,
+      annotated: defaultPreferences.saveAnnotated,
     });
     setAdvancedVideo(video);
   }
@@ -335,13 +334,13 @@ export function VideoManager() {
       if (modules.speed && (!Number.isFinite(mpp) || mpp <= 0)) {
         throw new Error("Overspeed needs a positive meters-per-pixel calibration value.");
       }
-      const prefs = loadPreferences();
+      const prefs = defaultPreferences;
       const config: AnalysisConfig = {
         conf: prefs.conf,
         iou: prefs.iou,
         imgsz: prefs.imgsz,
         track_buffer: prefs.trackBuffer,
-        tracker_type: prefs.trackerType ?? "bytetrack",
+        tracker_type: prefs.trackerType,
         debug_mode: prefs.debugMode,
         frame_stride: prefs.frameStride,
         target_fps: prefs.targetFps,

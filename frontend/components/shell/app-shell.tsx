@@ -10,12 +10,10 @@ import {
   Menu,
   Radio,
   Scan,
-  Settings,
   ShieldAlert,
   X,
 } from "lucide-react";
 import { liveStreamUrl } from "@/lib/api";
-import { loadPreferences } from "@/lib/settings";
 import { useTrafficData } from "@/components/providers/data-provider";
 import { cn } from "@/lib/utils";
 
@@ -25,7 +23,6 @@ const links = [
   { href: "/detection", label: "Vehicle Detection", icon: Scan },
   { href: "/violations", label: "Traffic Violations", icon: ShieldAlert },
   { href: "/analytics", label: "Analytics", icon: Activity },
-  { href: "/settings", label: "Settings", icon: Settings },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -37,7 +34,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const items = stream ? [...links.slice(0, 2), { href: "/live", label: "Live Analysis", icon: Radio }, ...links.slice(2)] : links;
 
   useEffect(() => {
-    document.documentElement.dataset.accent = loadPreferences().accent;
+    document.documentElement.dataset.accent = "violet";
     const timer = window.setTimeout(() => setMounted(true), 0);
     return () => window.clearTimeout(timer);
   }, []);

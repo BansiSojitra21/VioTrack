@@ -1,3 +1,4 @@
+/** Fixed analysis defaults — not user-editable. */
 export interface Preferences {
   conf: number;
   iou: number;
@@ -26,31 +27,7 @@ export const defaultPreferences: Preferences = {
   accent: "violet",
 };
 
-const KEY = "trafficai-preferences";
-
+/** Always returns the locked defaults (localStorage overrides are ignored). */
 export function loadPreferences(): Preferences {
-  if (typeof window === "undefined") return defaultPreferences;
-  try {
-    const raw = window.localStorage.getItem(KEY);
-    if (!raw) return defaultPreferences;
-    const stored = JSON.parse(raw) as Partial<Preferences>;
-    const usedOldDetectionDefaults =
-      (stored.imgsz == null || stored.imgsz === 960) &&
-      stored.conf === 0.35 &&
-      stored.iou === 0.45;
-    return {
-      ...defaultPreferences,
-      ...stored,
-      conf: usedOldDetectionDefaults ? defaultPreferences.conf : stored.conf ?? defaultPreferences.conf,
-      iou: usedOldDetectionDefaults ? defaultPreferences.iou : stored.iou ?? defaultPreferences.iou,
-      imgsz: usedOldDetectionDefaults ? defaultPreferences.imgsz : stored.imgsz ?? defaultPreferences.imgsz,
-    };
-  } catch {
-    return defaultPreferences;
-  }
-}
-
-export function savePreferences(preferences: Preferences) {
-  window.localStorage.setItem(KEY, JSON.stringify(preferences));
-  document.documentElement.dataset.accent = preferences.accent;
+  return { ...defaultPreferences };
 }

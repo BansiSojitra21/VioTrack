@@ -121,11 +121,9 @@ HELMET_WEIGHTS=helmet.pt
 DEVICE=auto
 ```
 
-`DEVICE=auto` selects CUDA when available and otherwise uses CPU. `DEVICE=0` explicitly selects the first CUDA GPU. Inference defaults are confidence `0.25`, NMS IoU `0.50`, and image size `640`; Analysis Settings let you adjust confidence, IoU, image size, analysis FPS, frame stride, and the ByteTrack lost-track buffer. On the included overhead traffic footage, 640-pixel inference detected vehicles in the opening frame while 960-pixel inference returned none. Higher image sizes may help other views, but should be checked against the target camera because they can also reduce detections.
+`DEVICE=auto` selects CUDA when available and otherwise uses CPU. `DEVICE=0` explicitly selects the first CUDA GPU. Inference defaults are locked in the app (confidence `0.25`, NMS IoU `0.50`, image size `960`, frame stride `1`, ByteTrack buffer `30`) and are not user-editable — the Settings page was removed.
 
-Each offline analysis owns one persistent Ultralytics ByteTrack session. The tracker is reset for every job, and reported IDs are scoped to that video/job. Playback overlays use stored detections with original frame indexes and source timestamps; the analysis page does not run a second, unsynchronized detector over the playing video.
-
-Enable **Save debug frames for new analyses** in Settings to keep input and tracked-output images plus JSON metadata for the first 10 processed frames of each job. Open **View debug frames** from that analysis to inspect them. Debug artifacts are stored under the configured data directory and cleared if a job is cancelled.
+Each offline analysis owns one persistent Ultralytics ByteTrack session. The tracker is reset for every job, and reported IDs are scoped to that video/job. Playback overlays use stored detections with original frame indexes and source timestamps; while a job is still processing, a live YOLO pass can fill boxes ahead of the saved timeline.
 
 `ALLOW_WEIGHT_DOWNLOAD=true` lets Ultralytics fetch a known official checkpoint the first time a job runs. Leave it false on a locked-down server and copy the file yourself.
 
