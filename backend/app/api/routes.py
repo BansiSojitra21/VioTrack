@@ -16,7 +16,10 @@ from app.analytics.processor import most_common_violation, summarize, traffic_se
 from app.core.config import settings
 from app.detection.labels import VEHICLE_CLASSES
 from app.detection.license_plate import normalize_plate_text
-from app.detection.dedupe import suppress_duplicate_detections as _suppress_duplicate_frame_detections
+from app.detection.dedupe import (
+    is_spurious_truck as _is_spurious_truck,
+    suppress_duplicate_detections as _suppress_duplicate_frame_detections,
+)
 from app.detection.types import Detection
 from app.schemas.models import ReviewUpdate, StartAnalysis
 from app.services import repository, storage
@@ -377,7 +380,8 @@ async def detect_frame(
 
     # Reuse the model between playback-frame requests; loading weights on every
     # frame would add seconds of latency and make live overlays unusable.
-    engine = _frame_engine(float(conf), float(iou))
+    live_imgsz = int(imgsz) if imgsz and imgsz > 0 else settings.yolo_imgsz
+    engine = _frame_engine(float(conf), float(iou), live_imgsz)
     try:
         detections = engine.predict(image, 0, 0.0)
     except ModelUnavailableError as exc:
@@ -528,7 +532,16 @@ def _filter_playback_detections(
         canopy = cy < frame_h * 0.42
         if roadside and canopy and detection.confidence < 0.55:
             continue
-        if detection.confidence < 0.28:
+        # Truck-on-trees FPs are often high-confidence — always drop canopy trucks.
+        if _is_spurious_truck(detection.bbox, detection.class_name, frame_w, frame_h):
+            continue
+        if detection.confidence < 0.32:
+            continue
+        # Trucks need a stronger score; COCO often tags foliage as truck at ~0.7–0.8.
+        if detection.class_name == "truck" and detection.confidence < 0.55:
+            continue
+        # Ghost bikes on asphalt / shadows — keep mild floor so real bikes still show.
+        if detection.class_name in {"motorcycle", "bicycle"} and detection.confidence < 0.36:
             continue
         kept.append(detection)
     return kept
@@ -541,14 +554,18 @@ def _weights_ready() -> bool:
     return Path(value).is_file() or (settings.weights_dir / value).is_file() or settings.allow_weight_download
 
 
-def _frame_engine(conf: float, iou: float) -> Any:
+def _frame_engine(conf: float, iou: float, imgsz: int | None = None) -> Any:
     from app.detection.yolo_engine import vehicle_engine
 
-    engine_key = (conf, iou, settings.yolo_imgsz)
+    size = int(imgsz) if imgsz and imgsz > 0 else settings.yolo_imgsz
+    # Live overlay prefers a smaller size so boxes return while analysis runs on CPU.
+    size = max(320, min(size, 640))
+    engine_key = (round(float(conf), 3), round(float(iou), 3), size)
     engine = _frame_engines.get(engine_key)
     if engine is None:
-        _frame_engines.clear()
-        engine = vehicle_engine(conf, iou, settings.yolo_imgsz, share_weights=False)
+        if len(_frame_engines) >= 4:
+            _frame_engines.clear()
+        engine = vehicle_engine(conf, iou, size, share_weights=False)
         _frame_engines[engine_key] = engine
     return engine
 

@@ -286,7 +286,12 @@ class YoloEngine:
         xyxy = boxes.xyxy.cpu().numpy()
         confs = boxes.conf.cpu().numpy()
         classes = boxes.cls.cpu().numpy().astype(int)
-        track_ids = boxes.id.cpu().numpy().astype(int) if has_track_ids and boxes.id is not None else None
+        track_ids = None
+        if has_track_ids and boxes.id is not None:
+            try:
+                track_ids = boxes.id.cpu().numpy().astype(int)
+            except Exception:
+                track_ids = None
         for index, (box, score, class_id) in enumerate(zip(xyxy, confs, classes)):
             class_id = int(class_id)
             raw_name = self.status.class_map.get(class_id, str(class_id))
@@ -301,6 +306,10 @@ class YoloEngine:
             if valid_bbox is None:
                 self.invalid_bbox_count += 1
                 continue
+            # Ultralytics occasionally returns fewer track IDs than boxes — never IndexError.
+            tracking_id = None
+            if track_ids is not None and index < len(track_ids):
+                tracking_id = int(track_ids[index])
             detections.append(
                 Detection(
                     class_id=class_id,
@@ -309,7 +318,7 @@ class YoloEngine:
                     bbox=valid_bbox,
                     frame_number=frame_number,
                     timestamp_sec=timestamp_sec,
-                    tracking_id=int(track_ids[index]) if track_ids is not None else None,
+                    tracking_id=tracking_id,
                 )
             )
         return detections

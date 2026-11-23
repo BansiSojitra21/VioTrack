@@ -44,10 +44,14 @@ class Track:
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:
+        if not self.history:
+            return (0.0, 0.0, 0.0, 0.0)
         return self.history[-1].bbox
 
     @property
     def confidence(self) -> float:
+        if not self.history:
+            return 0.0
         return self.history[-1].confidence
 
 

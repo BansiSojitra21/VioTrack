@@ -146,6 +146,8 @@ class ByteTrack:
         for track in self.tracks:
             if track.track_id not in matched_ids:
                 continue
+            if not track.history:
+                continue
             point = track.history[-1]
             output.append(
                 Detection(
@@ -241,11 +243,10 @@ class ByteTrack:
         )
         track.hits += 1
         track.time_since_update = 0
-        # Soft-penalize truck votes when the track is already a car — hatchbacks
-        # are frequently double-fired as truck and should not flip the label.
+        # Soft-penalize truck votes — hatchbacks/foliage are often tagged truck.
         vote = detection.confidence
-        if detection.class_name == "truck" and track.class_name == "car":
-            vote *= 0.65
+        if detection.class_name == "truck":
+            vote *= 0.55 if track.class_name == "car" else 0.75
         if detection.class_name == "motorcycle" and track.class_name in {"car", "truck", "bus"}:
             vote *= 0.45
         track.class_votes[detection.class_name] = (

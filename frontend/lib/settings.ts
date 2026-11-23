@@ -14,16 +14,17 @@ export interface Preferences {
 }
 
 export const defaultPreferences: Preferences = {
-  conf: 0.25,
+  // Locked balance: enough recall for bikes/cars, still filters weak ghosts.
+  conf: 0.32,
   iou: 0.5,
-  imgsz: 960,
-  frameStride: 1,
+  imgsz: 640,
+  frameStride: 2,
   trackBuffer: 30,
   trackerType: "bytetrack",
   debugMode: false,
   targetFps: null,
   maxFrames: 20000,
-  saveAnnotated: true,
+  saveAnnotated: false,
   accent: "violet",
 };
 

@@ -17,7 +17,7 @@ import numpy as np
 from app.analytics.processor import summarize
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.detection.dedupe import suppress_duplicate_detections
+from app.detection.dedupe import is_spurious_truck, suppress_duplicate_detections
 from app.detection.license_plate import read_vehicle_plates
 from app.detection.labels import VEHICLE_CLASSES
 from app.detection.types import Detection, centroid
@@ -482,7 +482,22 @@ def _analyze(job: dict, video: dict, config: dict) -> None:
         inference_ms = (time.perf_counter() - inference_started) * 1000
         # Drop car+truck+bike stacks on one vehicle before / after association.
         detections = suppress_duplicate_detections(detections)
+        detections = [
+            det
+            for det in detections
+            if not is_spurious_truck(det.bbox, det.class_name, width, height)
+            and not (det.class_name == "truck" and float(det.confidence or 0) < 0.55)
+            and not (
+                det.class_name in {"motorcycle", "bicycle"}
+                and float(det.confidence or 0) < 0.36
+            )
+        ]
         tracked = suppress_duplicate_detections(tracker.update(detections, frame_index, timestamp))
+        tracked = [
+            det
+            for det in tracked
+            if not is_spurious_truck(det.bbox, det.class_name, width, height)
+        ]
         if processed == 0 or (processed + 1) % 10 == 0:
             active_ids = sorted(
                 detection.tracking_id
@@ -536,9 +551,11 @@ def _analyze(job: dict, video: dict, config: dict) -> None:
             for det in tracked
             if det.tracking_id is not None and det.class_name in {"person", "pedestrian", "motorcycle"}
         ]
-        for tracking_id, plate in read_vehicle_plates(frame, tracked_vehicles).items():
-            if tracking_id not in plate_by_track or plate[1] > plate_by_track[tracking_id][1]:
-                plate_by_track[tracking_id] = plate
+        # Plate OCR is expensive on CPU — sample every 4th processed frame.
+        if tracked_vehicles and processed % 4 == 0:
+            for tracking_id, plate in read_vehicle_plates(frame, tracked_vehicles).items():
+                if tracking_id not in plate_by_track or plate[1] > plate_by_track[tracking_id][1]:
+                    plate_by_track[tracking_id] = plate
         for det in tracked:
             conf = float(det.confidence) if det.confidence is not None else float("nan")
             if not math.isfinite(conf) or conf < 0.0 or conf > 1.0:

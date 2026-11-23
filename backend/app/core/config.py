@@ -18,12 +18,12 @@ class Settings(BaseSettings):
     max_upload_mb: int = 200
     max_duration_sec: float = 180
     max_frames: int = 2400
-    frame_stride: int = 1
+    frame_stride: int = 2
     yolo_weights: str = "yolo11n.pt"
     helmet_weights: str = ""
-    yolo_conf: float = 0.25
+    yolo_conf: float = 0.32
     yolo_iou: float = 0.50
-    yolo_imgsz: int = 960
+    yolo_imgsz: int = 640
     track_buffer: int = 30
     yolo_tracker: str = "bytetrack"
     device: str = "auto"

@@ -106,8 +106,14 @@ def select_vehicle_plates(
         plate = _readable_plate(result)
         if plate is None:
             continue
-        box = result.detection.bounding_box
-        plate_bbox = (box.x1, box.y1, box.x2, box.y2)
+        detection = getattr(result, "detection", None)
+        box = getattr(detection, "bounding_box", None) if detection is not None else None
+        if box is None:
+            continue
+        try:
+            plate_bbox = (float(box.x1), float(box.y1), float(box.x2), float(box.y2))
+        except (TypeError, ValueError, AttributeError):
+            continue
         matches = [
             (tracking_id, _overlap_ratio(plate_bbox, vehicle_bbox))
             for tracking_id, vehicle_bbox in vehicles

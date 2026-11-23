@@ -6,6 +6,7 @@ import {
   easeBBox,
   expandTwoWheelerBBox,
   groupDetections,
+  isSpuriousTruck,
   isValidBBox,
   lerpBBox,
   medianGap,
@@ -313,5 +314,23 @@ const broken = stabilizeOverlay(
   { confirmHits: 1, minDisplayConf: 0.38, frameW: 1920, frameH: 1080 },
 );
 assert.equal(broken.boxes.length, 0, "Infinity/full-frame boxes must be rejected");
+
+// Truck-on-trees FPs (high conf canopy boxes) must not display.
+assert.equal(isSpuriousTruck([20, 40, 280, 220], "truck", 1280, 720), true);
+assert.equal(isSpuriousTruck([400, 280, 700, 520], "truck", 1280, 720), false);
+const canopyTruck = sanitizeDetection(
+  det({
+    id: "fake-truck",
+    tracking_id: 11,
+    timestamp_sec: 1,
+    confidence: 0.8,
+    class_name: "truck",
+    class_id: 7,
+    bbox: [20, 40, 280, 220],
+  }),
+  1280,
+  720,
+);
+assert.equal(canopyTruck, null, "canopy truck FP must be sanitized out");
 
 console.log("playback-boxes tests passed");

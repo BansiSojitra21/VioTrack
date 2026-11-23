@@ -75,6 +75,39 @@ def prefer_vehicle_detection(a: Detection, b: Detection) -> Detection:
     return winner
 
 
+def is_spurious_truck(
+    bbox: tuple[float, float, float, float],
+    class_name: str,
+    frame_w: int = 0,
+    frame_h: int = 0,
+) -> bool:
+    """Drop truck FPs on trees/buildings (common with COCO YOLO on street cams).
+
+    Real trucks sit on the roadway; foliage hallucinations usually float in the
+    upper canopy and never reach the road surface.
+    """
+    if class_name != "truck" or frame_h <= 0:
+        return False
+    x1, y1, x2, y2 = bbox
+    width = max(0.0, x2 - x1)
+    height = max(0.0, y2 - y1)
+    if width < 1 or height < 1:
+        return True
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+    # Bottom of box never reaches mid-frame → not on the road.
+    if y2 < frame_h * 0.48:
+        return True
+    # Center stuck in the upper canopy band.
+    if cy < frame_h * 0.36:
+        return True
+    # Tall canopy patch hugging the left/right edge (trees beside the street).
+    roadside = frame_w > 0 and (cx < frame_w * 0.18 or cx > frame_w * 0.82)
+    if roadside and cy < frame_h * 0.5:
+        return True
+    return False
+
+
 def suppress_duplicate_detections(detections: list[Detection]) -> list[Detection]:
     """Collapse stacked vehicle boxes. Keep pedestrians separate for helmet heuristics."""
     vehicles = [det for det in detections if det.class_name in VEHICLE_CLASSES]

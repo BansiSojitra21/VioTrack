@@ -69,6 +69,25 @@ export function isOversizedVehicleBox(
   return areaRatio > 0.2 || w / frameW > 0.5 || h / frameH > 0.65;
 }
 
+/** Drop truck FPs on trees/buildings (COCO YOLO often tags canopy as truck). */
+export function isSpuriousTruck(
+  bbox: number[],
+  className: string,
+  frameW = 0,
+  frameH = 0,
+): boolean {
+  if (className !== "truck" || frameH <= 0 || !isValidBBox(bbox)) return false;
+  const [w, h] = boxSize(bbox);
+  if (w < 1 || h < 1) return true;
+  const [cx, cy] = boxCenter(bbox);
+  const y2 = bbox[3];
+  if (y2 < frameH * 0.48) return true;
+  if (cy < frameH * 0.36) return true;
+  const roadside = frameW > 0 && (cx < frameW * 0.18 || cx > frameW * 0.82);
+  if (roadside && cy < frameH * 0.5) return true;
+  return false;
+}
+
 /**
  * Mild upward pad for short bike-body crops only.
  * Never scale by width — that previously turned medium boxes into full-frame covers.
@@ -124,12 +143,15 @@ export function sanitizeDetection(
 ): DetectionRecord | null {
   const confidence = sanitizeConfidence(detection.confidence);
   if (confidence == null) return null;
+  if (detection.class_name === "truck" && confidence < 0.55) return null;
   const rawBBox = detection.bbox.map((value) => Number(value));
   if (!isValidBBox(rawBBox, frameW, frameH)) return null;
   if (isOversizedVehicleBox(rawBBox, detection.class_name, frameW, frameH)) return null;
+  if (isSpuriousTruck(rawBBox, detection.class_name, frameW, frameH)) return null;
   const bbox = expandTwoWheelerBBox(rawBBox, detection.class_name, frameW, frameH);
   if (!isValidBBox(bbox, frameW, frameH)) return null;
   if (isOversizedVehicleBox(bbox, detection.class_name, frameW, frameH)) return null;
+  if (isSpuriousTruck(bbox, detection.class_name, frameW, frameH)) return null;
   return {
     ...detection,
     confidence,

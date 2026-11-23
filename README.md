@@ -121,7 +121,7 @@ HELMET_WEIGHTS=helmet.pt
 DEVICE=auto
 ```
 
-`DEVICE=auto` selects CUDA when available and otherwise uses CPU. `DEVICE=0` explicitly selects the first CUDA GPU. Inference defaults are locked in the app (confidence `0.25`, NMS IoU `0.50`, image size `960`, frame stride `1`, ByteTrack buffer `30`) and are not user-editable — the Settings page was removed.
+`DEVICE=auto` selects CUDA when available and otherwise uses CPU. `DEVICE=0` explicitly selects the first CUDA GPU. Inference defaults are locked in the app (confidence `0.32`, NMS IoU `0.50`, image size `640`, frame stride `2`, ByteTrack buffer `30`, annotated video off) and are not user-editable — the Settings page was removed. Weak motorcycle scores below `0.36` are dropped to reduce asphalt/shadow ghosts. Playback boxes follow the playhead lerp directly (no double smoothing). A CUDA GPU is still the biggest speed win.
 
 Each offline analysis owns one persistent Ultralytics ByteTrack session. The tracker is reset for every job, and reported IDs are scoped to that video/job. Playback overlays use stored detections with original frame indexes and source timestamps; while a job is still processing, a live YOLO pass can fill boxes ahead of the saved timeline.
 

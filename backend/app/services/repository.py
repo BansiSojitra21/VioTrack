@@ -136,16 +136,41 @@ def fail_interrupted_jobs() -> int:
 
 
 def _process_is_running(pid: int) -> bool:
+    """Return True if a worker PID still looks alive.
+
+    On Windows, ``os.kill(pid, 0)`` can raise several WinErrors for dead or
+    invalid PIDs (87 invalid parameter, 11 incorrect format, etc.). Treat those
+    as not-running so API startup never crashes on stale job rows.
+    """
     try:
-        os.kill(pid, 0)
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            # PROCESS_QUERY_LIMITED_INFORMATION — works across sessions without full access.
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid_int)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            # 5 = ACCESS_DENIED → process exists but we cannot open it.
+            return ctypes.windll.kernel32.GetLastError() == 5
+        except Exception:
+            return False
+
+    try:
+        os.kill(pid_int, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
-    except OSError as exc:
-        if os.name == "nt" and exc.winerror == 87:
-            return False
-        raise
+    except OSError:
+        return False
     return True
 
 

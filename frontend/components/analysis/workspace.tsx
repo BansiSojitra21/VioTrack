@@ -67,6 +67,23 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   const sessionGenRef = useRef(0);
   const jobStatusRef = useRef<JobRecord["status"] | undefined>(undefined);
   const captureNoticeRef = useRef(false);
+  const lastUiNowRef = useRef(0);
+  const overlayPackRef = useRef<{
+    detectionsByTrack: ReturnType<typeof groupDetections>;
+    liveGrouped: ReturnType<typeof groupDetections>;
+    detectionGap: number;
+    liveGap: number;
+    storedUntil: number;
+    analysisActive: boolean;
+    completedLatch: boolean;
+    conf: number;
+    frameW: number;
+    frameH: number;
+    trackViolations: Map<number, { time: number; type: string }>;
+    playbackMode: "overlay" | "annotated";
+    viewJob: JobRecord | null;
+    viewVideo: VideoRecord | null;
+  } | null>(null);
   const [liveDetections, setLiveDetections] = useState<DetectionRecord[]>([]);
   const [job, setJob] = useState<JobRecord | null>(null);
   const [video, setVideo] = useState<VideoRecord | null>(null);
@@ -76,6 +93,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
   const [violations, setViolations] = useState<ViolationRecord[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [now, setNow] = useState(0);
+  const [visible, setVisible] = useState<DetectionRecord[]>([]);
   const [isVideoPlaying, setIsVideoPlaying] = useState(false);
   const replayWithDetections = useCallback(() => {
     const media = videoRef.current;
@@ -275,20 +293,28 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       ? Math.max(0, viewJob.frames_processed - 1) / sampleFps
       : duration;
 
-  // Retain the violation start time so a vehicle changes to red at the
-  // crossing, rather than being red throughout the earlier part of its track.
-  const redLightViolationTimes = useMemo(() => {
-    const violationTimes = new Map<number, number>();
-    const markViolation = (trackId: number, time: number) => {
-      const previous = violationTimes.get(trackId);
-      if (previous == null || time < previous) violationTimes.set(trackId, time);
+  // Earliest real violation per track (with its type). Do not label every flag as red-light.
+  const trackViolations = useMemo(() => {
+    const byTrack = new Map<number, { time: number; type: string }>();
+    const markViolation = (trackId: number, time: number, type: string) => {
+      const previous = byTrack.get(trackId);
+      if (previous == null || time < previous.time) byTrack.set(trackId, { time, type });
     };
     for (const v of viewViolations) {
-      if (v.tracking_id != null) markViolation(v.tracking_id, v.timestamp_sec);
+      if (v.tracking_id != null && v.violation_type) {
+        markViolation(v.tracking_id, v.timestamp_sec, v.violation_type);
+      }
     }
     const stopLine = viewJob?.config?.stop_line;
     const timeline = viewJob?.config?.signal_timeline;
-    if (stopLine && stopLine.length === 2 && timeline && overlayDetections.length > 0) {
+    const redLightEnabled = viewJob?.config?.enable_red_light !== false;
+    if (
+      redLightEnabled &&
+      stopLine &&
+      stopLine.length === 2 &&
+      timeline &&
+      overlayDetections.length > 0
+    ) {
       const vw = viewVideo?.width || 1;
       const vh = viewVideo?.height || 1;
       const sl1: [number, number] = [
@@ -326,87 +352,93 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
             }
           }
           if (isRed && segmentsIntersect(p1.centroid, p2.centroid, sl1, sl2)) {
-            markViolation(tid, p2.time);
+            markViolation(tid, p2.time, "red_light");
             break;
           }
         }
       }
     }
-    return violationTimes;
+    return byTrack;
   }, [overlayDetections, viewViolations, viewJob?.config, viewVideo]);
 
-  const effectiveNow = now;
   const analysisActive =
     viewJob?.status === "pending" || viewJob?.status === "processing";
-  // While analysis is running, always draw from live YOLO so boxes appear
-  // immediately — do not wait for the worker to pass each playhead frame.
-  // After the job finishes, use saved tracks (with hysteresis near the watermark).
-  if (analysisActive) {
-    savedOverlayLatchRef.current = false;
-  } else if (
+  const completedLatch =
     data?.source === "sample" ||
     viewJob?.status === "completed" ||
     viewJob?.status === "cancelled" ||
-    viewJob?.status === "failed"
-  ) {
-    savedOverlayLatchRef.current = true;
-  } else if (storedUntil >= 0 && effectiveNow <= storedUntil + 0.25) {
-    savedOverlayLatchRef.current = true;
-  } else if (storedUntil < 0 || effectiveNow > storedUntil + 0.55) {
-    savedOverlayLatchRef.current = false;
-  }
-  const useSavedTracks = savedOverlayLatchRef.current;
-  const overlayModeRef = useRef(useSavedTracks);
-  if (overlayModeRef.current !== useSavedTracks) {
-    // Keep existing visible tracks during handoff so boxes do not blink off.
-    overlayModeRef.current = useSavedTracks;
-  }
+    viewJob?.status === "failed";
 
-  const visible = useMemo(() => {
-    // Keep detection recall reasonably high; the stabilizer rejects one-frame FPs.
-    const displayThreshold = useSavedTracks
-      ? (viewJob?.config?.conf ?? 0.25)
-      : Math.max(viewJob?.config?.conf ?? 0.25, 0.28);
-    const liveRaw = boxesAtPlayhead(
-      liveGrouped.byTrack,
-      liveGrouped.untracked,
-      effectiveNow,
-      Math.max(liveGap, 0.12),
-      displayThreshold,
-    );
-    const savedRaw = boxesAtPlayhead(
-      detectionsByTrack.byTrack,
-      detectionsByTrack.untracked,
-      effectiveNow,
-      detectionGap,
-      displayThreshold,
-    );
-    // During analysis prefer live; if a live round is still in flight, fall back to
-    // any saved rows that already arrived so the overlay is never blank.
-    const raw = useSavedTracks ? savedRaw : liveRaw.length > 0 ? liveRaw : savedRaw;
-    const stabilized = stabilizeOverlay(stableTracksRef.current, raw, effectiveNow, {
-      persistSec: useSavedTracks ? 0.55 : 0.7,
-      alpha: 0.8,
-      // Show the first live hit immediately (was 2 → boxes lagged until a 2nd frame).
-      confirmHits: 1,
-      minDisplayConf: 0.35,
-      frameW: viewVideo?.width ?? 0,
-      frameH: viewVideo?.height ?? 0,
-    });
-    stableTracksRef.current = stabilized.state;
-    return stabilized.boxes;
-  }, [
-    detectionGap,
+  // Snapshot overlay inputs for the video-frame paint loop (avoids React lag).
+  overlayPackRef.current = {
     detectionsByTrack,
-    effectiveNow,
-    liveGap,
     liveGrouped,
-    useSavedTracks,
-    viewJob?.config?.conf,
-    viewVideo?.height,
-    viewVideo?.width,
-  ]);
+    detectionGap,
+    liveGap,
+    storedUntil,
+    analysisActive,
+    completedLatch: Boolean(completedLatch),
+    conf: viewJob?.config?.conf ?? 0.32,
+    frameW: viewVideo?.width ?? 0,
+    frameH: viewVideo?.height ?? 0,
+    trackViolations,
+    playbackMode,
+    viewJob,
+    viewVideo,
+  };
 
+  const resolveUseSavedTracks = useCallback((time: number) => {
+    const pack = overlayPackRef.current;
+    if (!pack) return savedOverlayLatchRef.current;
+    if (pack.analysisActive) {
+      savedOverlayLatchRef.current = false;
+    } else if (pack.completedLatch) {
+      savedOverlayLatchRef.current = true;
+    } else if (pack.storedUntil >= 0 && time <= pack.storedUntil + 0.25) {
+      savedOverlayLatchRef.current = true;
+    } else if (pack.storedUntil < 0 || time > pack.storedUntil + 0.55) {
+      savedOverlayLatchRef.current = false;
+    }
+    return savedOverlayLatchRef.current;
+  }, []);
+
+  const boxesForTime = useCallback(
+    (time: number) => {
+      const pack = overlayPackRef.current;
+      if (!pack) return [] as DetectionRecord[];
+      const useSavedTracks = resolveUseSavedTracks(time);
+      const displayThreshold = Math.max(pack.conf, 0.3);
+      const liveRaw = boxesAtPlayhead(
+        pack.liveGrouped.byTrack,
+        pack.liveGrouped.untracked,
+        time,
+        Math.max(pack.liveGap, 0.12),
+        displayThreshold,
+      );
+      const savedRaw = boxesAtPlayhead(
+        pack.detectionsByTrack.byTrack,
+        pack.detectionsByTrack.untracked,
+        time,
+        pack.detectionGap,
+        displayThreshold,
+      );
+      const raw = useSavedTracks ? savedRaw : liveRaw.length > 0 ? liveRaw : savedRaw;
+      const stabilized = stabilizeOverlay(stableTracksRef.current, raw, time, {
+        persistSec: useSavedTracks ? 0.35 : 0.4,
+        // Snap to playhead-lerped boxes — any easing here makes motion feel late.
+        alpha: 1,
+        confirmHits: 1,
+        minDisplayConf: 0.34,
+        frameW: pack.frameW,
+        frameH: pack.frameH,
+      });
+      stableTracksRef.current = stabilized.state;
+      return stabilized.boxes;
+    },
+    [resolveUseSavedTracks],
+  );
+
+  const useSavedTracks = resolveUseSavedTracks(now);
   const tracks = useSavedTracks
     ? detectionsByTrack.byTrack.size
     : Math.max(liveGrouped.byTrack.size, detectionsByTrack.byTrack.size);
@@ -445,12 +477,21 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
         schedule(isVideoPlaying ? 200 : 400);
         return;
       }
-      const minInterval = videoEl.paused ? 0.12 : 0.04;
+      // Live overlay must stay responsive ahead of the analysis watermark.
+      // Keep it lighter than the job so both can share a CPU without starving boxes.
+      const aheadOfAnalysis = coveredUntil < 0 || time > coveredUntil + 0.15;
+      const minInterval = aheadOfAnalysis
+        ? videoEl.paused
+          ? 0.22
+          : 0.1
+        : videoEl.paused
+          ? 0.45
+          : 0.28;
       if (
         captureBusyRef.current ||
         (lastCaptureAtRef.current >= 0 && Math.abs(time - lastCaptureAtRef.current) < minInterval)
       ) {
-        schedule(videoEl.paused ? 180 : 40);
+        schedule(aheadOfAnalysis ? (videoEl.paused ? 140 : 50) : videoEl.paused ? 280 : 140);
         return;
       }
       if (!videoEl.videoWidth || !videoEl.videoHeight) {
@@ -460,12 +501,16 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       if (lastCaptureAtRef.current >= 0 && Math.abs(time - lastCaptureAtRef.current) > 1.8) {
         sessionGenRef.current += 1;
         liveTracksRef.current = new Map();
-        // Keep stable overlay state so boxes do not vanish on seek recovery.
       }
 
+      // Downscale for live infer so boxes return quickly on CPU.
+      const srcW = videoEl.videoWidth;
+      const srcH = videoEl.videoHeight;
+      const maxSide = 640;
+      const scale = Math.min(1, maxSide / Math.max(srcW, srcH));
       const canvas = document.createElement("canvas");
-      canvas.width = videoEl.videoWidth;
-      canvas.height = videoEl.videoHeight;
+      canvas.width = Math.max(1, Math.round(srcW * scale));
+      canvas.height = Math.max(1, Math.round(srcH * scale));
       const context = canvas.getContext("2d");
       if (!context) return;
       try {
@@ -487,9 +532,9 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       }
       const body = new FormData();
       body.append("file", blob, "frame.jpg");
-      // Lower model conf for recall; frontend confirmation + minDisplayConf remove ghosts.
-      body.append("conf", String(Math.max(viewJob?.config?.conf ?? 0.25, 0.25)));
+      body.append("conf", String(Math.max(viewJob?.config?.conf ?? 0.32, 0.32)));
       body.append("iou", String(viewJob?.config?.iou ?? 0.5));
+      body.append("imgsz", "640");
       body.append("session_id", `playback-${jobId}-${sessionGenRef.current}`);
       const mediaFps = viewVideo?.fps || 25;
       body.append("frame_number", String(Math.max(0, Math.round(time * mediaFps))));
@@ -502,12 +547,20 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
         if (jobStatusRef.current !== "pending" && jobStatusRef.current !== "processing") return;
         const previous = liveTracksRef.current;
         const nextMap = new Map<number, DetectionRecord[]>();
+        const invScale = scale > 0 ? 1 / scale : 1;
         for (const item of result.items) {
           const trackId = item.tracking_id ?? item.track_id;
           if (trackId == null || !DISPLAY_VEHICLE_CLASSES.has(item.class_name)) continue;
           const confidence = sanitizeConfidence(item.confidence);
-          if (confidence == null || confidence < 0.25) continue;
+          const minLiveConf = item.class_name === "motorcycle" || item.class_name === "bicycle" ? 0.36 : 0.32;
+          if (confidence == null || confidence < minLiveConf) continue;
           if (!isValidBBox(item.bbox)) continue;
+          // Map boxes from the downscaled capture back to full video pixels.
+          const bbox =
+            scale < 1
+              ? item.bbox.map((value) => Number(value) * invScale)
+              : item.bbox;
+          if (!isValidBBox(bbox)) continue;
           const record: DetectionRecord = {
             id: `live-${sessionGenRef.current}-${trackId}-${time.toFixed(3)}`,
             job_id: jobId,
@@ -517,7 +570,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
             class_name: item.class_name,
             class_id: item.class_id ?? 0,
             confidence,
-            bbox: item.bbox,
+            bbox,
             tracking_id: -Math.abs(trackId),
             plate_number: null,
             sample: false,
@@ -530,11 +583,11 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
               : [...history, record];
           nextMap.set(trackId, points.slice(-8));
         }
-        // Keep missing tracks for ~0.7s so boxes stay continuous between live API rounds.
+        // Hold boxes longer between slow CPU live rounds.
         for (const [trackId, points] of previous.entries()) {
           if (nextMap.has(trackId)) continue;
           const last = points[points.length - 1];
-          if (last && time - last.timestamp_sec <= 0.7) nextMap.set(trackId, points.slice(-8));
+          if (last && time - last.timestamp_sec <= 1.4) nextMap.set(trackId, points.slice(-8));
         }
         liveTracksRef.current = nextMap;
         setLiveDetections([...nextMap.values()].flat());
@@ -545,7 +598,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
         }
       } finally {
         captureBusyRef.current = false;
-        if (!stopped) schedule(videoEl.paused ? 120 : 30);
+        if (!stopped) schedule(aheadOfAnalysis ? (videoEl.paused ? 140 : 45) : videoEl.paused ? 280 : 120);
       }
     };
 
@@ -570,6 +623,14 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
     const canvas = canvasRef.current;
     const media = videoRef.current;
     if (!canvas || !media) return;
+    const pack = overlayPackRef.current;
+    const playback = pack?.playbackMode ?? "overlay";
+    const job = pack?.viewJob ?? null;
+    const videoMeta = pack?.viewVideo ?? null;
+    const violationsByTrack = pack?.trackViolations ?? new Map();
+    // Paint against the real playhead — not React state (state lags 1+ frames).
+    const playhead = Number.isFinite(media.currentTime) ? media.currentTime : 0;
+    const frameBoxes = boxesForTime(playhead);
 
     const width = media.clientWidth || media.offsetWidth;
     const height = media.clientHeight || media.offsetHeight;
@@ -586,12 +647,12 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
     if (!context) return;
     context.clearRect(0, 0, width, height);
 
-    if (playbackMode === "annotated") {
+    if (playback === "annotated") {
       return;
     }
 
-    const vw = media.videoWidth || viewVideo?.width;
-    const vh = media.videoHeight || viewVideo?.height;
+    const vw = media.videoWidth || videoMeta?.width;
+    const vh = media.videoHeight || videoMeta?.height;
     if (!vw || !vh || vw <= 0 || vh <= 0) return;
     const objectFit = getComputedStyle(media).objectFit;
     const containScale = Math.min(width / vw, height / vh);
@@ -612,8 +673,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
     const contentRight = offsetX + contentWidth;
     const contentBottom = offsetY + contentHeight;
 
-    const currentNow = effectiveNow;
-    const job = viewJob;
+    const currentNow = playhead;
 
     // ── Stop line ──────────────────────────────────────────────────────────────
     if (
@@ -712,7 +772,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
     context.rect(offsetX, offsetY, contentWidth, contentHeight);
     context.clip();
     const placedLabels: { x: number; y: number; width: number; height: number }[] = [];
-    for (const detection of visible) {
+    for (const detection of frameBoxes) {
       if (!isValidBBox(detection.bbox, vw, vh)) continue;
       if (sanitizeConfidence(detection.confidence) == null) continue;
       const [x1, y1, x2, y2] = detection.bbox;
@@ -724,8 +784,8 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       if (boxWidth < 4 || boxHeight < 4) continue;
       const violationAt = detection.tracking_id == null
         ? undefined
-        : redLightViolationTimes.get(detection.tracking_id);
-      const isViolator = violationAt != null && effectiveNow >= violationAt;
+        : violationsByTrack.get(detection.tracking_id);
+      const isViolator = violationAt != null && playhead >= violationAt.time;
 
       // 🔴 Red = rule violator   🟢 Green = compliant
       const boxColor = isViolator ? "#ef4444" : "#22c55e";
@@ -781,28 +841,30 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
       }
     }
     context.restore();
-  }, [
-    effectiveNow,
-    redLightViolationTimes,
-    viewJob,
-    viewVideo,
-    visible,
-  ]);
+  }, [boxesForTime]);
 
   useEffect(() => {
     draw();
-  }, [draw]);
+  }, [draw, detectionsByTrack, liveGrouped, viewJob?.status, playbackMode]);
 
   useEffect(() => {
     const media = videoRef.current;
     if (!media || !isVideoPlaying) return;
 
-    // Prefer decoded-frame timing where available. Keep the overlay moving in
-    // browsers without it by sampling the playhead on animation frames.
+    const syncUi = (time: number) => {
+      // Sidebar/list can update slower; canvas already painted from currentTime.
+      if (Math.abs(time - lastUiNowRef.current) < 0.08) return;
+      lastUiNowRef.current = time;
+      setNow(time);
+      setVisible(boxesForTime(time));
+    };
+
+    // Prefer decoded-frame timing so boxes move with the exact displayed frame.
     if (!media.requestVideoFrameCallback) {
       let animationFrame = 0;
       const updatePlayhead = () => {
-        setNow(media.currentTime);
+        draw();
+        syncUi(media.currentTime);
         animationFrame = requestAnimationFrame(updatePlayhead);
       };
       animationFrame = requestAnimationFrame(updatePlayhead);
@@ -811,12 +873,13 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
 
     let callbackId = 0;
     const updatePlayhead = () => {
-      setNow(media.currentTime);
+      draw();
+      syncUi(media.currentTime);
       callbackId = media.requestVideoFrameCallback(updatePlayhead);
     };
     callbackId = media.requestVideoFrameCallback(updatePlayhead);
     return () => media.cancelVideoFrameCallback(callbackId);
-  }, [isVideoPlaying]);
+  }, [boxesForTime, draw, isVideoPlaying]);
 
   // The first pass is a responsive preview. After it ends, replay once with the
   // complete synchronized detection timeline if background analysis has finished.
@@ -919,7 +982,9 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
                 }}
                 onTimeUpdate={(event) => {
                   const media = event.currentTarget;
-                  setNow(media.currentTime);
+                  const time = media.currentTime;
+                  setNow(time);
+                  setVisible(boxesForTime(time));
                   draw();
                 }}
                 onSeeked={(event) => {
@@ -933,7 +998,10 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
                     setLiveDetections([]);
                     lastCaptureAtRef.current = -1;
                   }
+                  lastUiNowRef.current = time;
                   setNow(time);
+                  setVisible(boxesForTime(time));
+                  draw();
                 }}
                 onPlay={() => {
                   if (viewJob.status === "processing" || viewJob.status === "pending") {
@@ -980,14 +1048,15 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
               </li>
             ) : null}
             {visible.map((item) => {
-              const violationAt = item.tracking_id == null ? undefined : redLightViolationTimes.get(item.tracking_id);
-              const isViolator = violationAt != null && now >= violationAt;
+              const violationAt = item.tracking_id == null ? undefined : trackViolations.get(item.tracking_id);
+              const isViolator = violationAt != null && now >= violationAt.time;
               const trackId =
                 item.tracking_id == null
                   ? "—"
                   : item.tracking_id < 0
                     ? Math.abs(item.tracking_id)
                     : item.tracking_id;
+              const badgeLabel = violationAt ? titleCase(violationAt.type).toUpperCase() : "OK";
               return (
                 <li
                   key={item.id}
@@ -1001,7 +1070,7 @@ export function AnalysisWorkspace({ jobId }: { jobId: string }) {
                       {Math.round(item.confidence * 100)}%
                     </span>
                     {isViolator ? (
-                      <Badge tone="rose">RED LIGHT</Badge>
+                      <Badge tone="rose">{badgeLabel}</Badge>
                     ) : (
                       <Badge tone="green">OK</Badge>
                     )}
