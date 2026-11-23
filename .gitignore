@@ -76,8 +76,6 @@ ehthumbs.db
 *.code-workspace
 
 # Local tooling / agent scratch
-.cursor/
-.claude/
 .tmp/
 tmp/
 temp/
