@@ -1,0 +1,9 @@
+# Kaggle: mobeenfatimah/helmet-detection-dataset-yolo-format
+# path is filled by train_helmet.py / local kagglehub cache; override as needed.
+path: C:/Users/A/.cache/kagglehub/datasets/mobeenfatimah/helmet-detection-dataset-yolo-format/versions/1/helmet detection dataset
+train: train/images
+val: val/images
+nc: 2
+names:
+  0: without_helmet
+  1: with_helmet
