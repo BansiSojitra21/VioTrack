@@ -121,7 +121,7 @@ HELMET_WEIGHTS=helmet.pt
 DEVICE=auto
 ```
 
-`DEVICE=auto` selects CUDA when available and otherwise uses CPU. `DEVICE=0` explicitly selects the first CUDA GPU. Inference defaults are locked in the app (confidence `0.32`, NMS IoU `0.50`, image size `640`, frame stride `2`, ByteTrack buffer `30`, annotated video off) and are not user-editable — the Settings page was removed. Weak motorcycle scores below `0.36` are dropped to reduce asphalt/shadow ghosts. Playback boxes follow the playhead lerp directly (no double smoothing). A CUDA GPU is still the biggest speed win.
+`DEVICE=cpu` (default) keeps YOLO boxes consistent across machines. `DEVICE=0` uses the first CUDA GPU for speed but scores can drift vs CPU. With `DETERMINISTIC=true` and `INFERENCE_SEED=0`, RNGs are seeded so the same video + same `yolo11n.pt` + same `.env` produce matching boxes. Copy `backend/.env.example` to `.env` on every PC, use the same weights file, and re-run analysis after pulling. Inference defaults are locked in the app (confidence `0.32`, NMS IoU `0.50`, image size `640`, frame stride `2`, ByteTrack buffer `30`, annotated video off). Weak motorcycle scores below `0.36` are dropped. Playback boxes follow the playhead lerp directly.
 
 Each offline analysis owns one persistent Ultralytics ByteTrack session. The tracker is reset for every job, and reported IDs are scoped to that video/job. Playback overlays use stored detections with original frame indexes and source timestamps; while a job is still processing, a live YOLO pass can fill boxes ahead of the saved timeline.
 

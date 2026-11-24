@@ -26,7 +26,10 @@ class Settings(BaseSettings):
     yolo_imgsz: int = 640
     track_buffer: int = 30
     yolo_tracker: str = "bytetrack"
-    device: str = "auto"
+    # Default CPU so boxes match across machines; set DEVICE=0 only when you accept GPU drift.
+    device: str = "cpu"
+    deterministic: bool = True
+    inference_seed: int = 0
     allow_weight_download: bool = False
     cloudinary_url: str = ""
     log_level: str = "INFO"

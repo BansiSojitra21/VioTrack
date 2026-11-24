@@ -26,6 +26,7 @@ logger = get_logger(__name__)
 _MODEL_CACHE: dict[str, Any] = {}
 _MODEL_LOCKS: dict[str, threading.Lock] = {}
 _MODEL_LOCKS_GUARD = threading.Lock()
+_DETERMINISM_READY = False
 
 
 def _shared_model_lock(target: str) -> threading.Lock:
@@ -35,6 +36,34 @@ def _shared_model_lock(target: str) -> threading.Lock:
             lock = threading.Lock()
             _MODEL_LOCKS[target] = lock
         return lock
+
+
+def _ensure_determinism() -> None:
+    """Seed RNGs so the same video + weights + settings produce matching boxes."""
+    global _DETERMINISM_READY
+    if _DETERMINISM_READY or not settings.deterministic:
+        return
+    seed = int(settings.inference_seed)
+    try:
+        import random
+
+        import numpy as np
+        import torch
+
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("Could not enable full deterministic inference: %s", exc)
+    _DETERMINISM_READY = True
 
 
 class ModelUnavailableError(RuntimeError):
@@ -140,6 +169,7 @@ class YoloEngine:
             logger.error("ultralytics import failed: %s", exc)
             return self.status
         try:
+            _ensure_determinism()
             resolved = settings.resolve_weights(self.weights_setting)
             target = str(resolved) if resolved else self.weights_setting
             if self.share_weights:
@@ -152,17 +182,21 @@ class YoloEngine:
             else:
                 self._model = YOLO(target)
             if self.device == "auto":
-                try:
-                    import torch
-
-                    if torch.cuda.is_available():
-                        self.device = "0"
-                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                        self.device = "mps"
-                    else:
-                        self.device = "cpu"
-                except Exception:
+                # Prefer CPU when deterministic matching across machines matters.
+                if settings.deterministic:
                     self.device = "cpu"
+                else:
+                    try:
+                        import torch
+
+                        if torch.cuda.is_available():
+                            self.device = "0"
+                        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                            self.device = "mps"
+                        else:
+                            self.device = "cpu"
+                    except Exception:
+                        self.device = "cpu"
             names = getattr(self._model, "names", {}) or {}
             if isinstance(names, dict):
                 self.status.class_map = {int(k): normalize_label(str(v)) for k, v in names.items()}
@@ -210,6 +244,8 @@ class YoloEngine:
             "iou": self.iou,
             "imgsz": self.imgsz,
             "verbose": False,
+            "half": False,
+            "agnostic_nms": False,
         }
         if self.class_filter is not None:
             predict_options["classes"] = list(self.class_filter)
