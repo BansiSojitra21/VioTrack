@@ -521,7 +521,11 @@ export function VideoManager() {
                     Advanced options
                   </Button>
                   {latestJob ? (
-                    <Button variant="secondary" onClick={() => router.push(`/analysis/${latestJob.id}`)}>
+                    <Button
+                      variant="secondary"
+                      disabled={analysisActive}
+                      onClick={() => router.push(`/analysis/${latestJob.id}`)}
+                    >
                       {latestJob.status === "processing"
                         ? `View progress · ${Math.round(latestJob.progress * 100)}%`
                         : latestJob.status === "pending"

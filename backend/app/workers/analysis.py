@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import shutil
 import threading
 import time
@@ -34,6 +35,8 @@ _worker_lock = threading.RLock()
 
 
 class AnnotatedVideoWriter:
+    _SENTINEL = object()
+
     def __init__(self, path: Path, fps: float, width: int, height: int) -> None:
         import imageio_ffmpeg
 
@@ -46,7 +49,7 @@ class AnnotatedVideoWriter:
             pix_fmt_out="yuv420p",
             fps=fps,
             quality=None,
-            output_params=["-preset", "veryfast", "-crf", "23", "-movflags", "+faststart"],
+            output_params=["-preset", "superfast", "-crf", "23", "-movflags", "+faststart"],
             ffmpeg_log_level="error",
         )
         try:
@@ -55,20 +58,45 @@ class AnnotatedVideoWriter:
             self._writer.close()
             self.path.unlink(missing_ok=True)
             raise RuntimeError(f"Could not start H.264 encoding for annotated video: {exc}") from exc
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=4)
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._encode_loop,
+            name=f"ffmpeg-writer-{path.stem}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _encode_loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is self._SENTINEL:
+                return
+            try:
+                frame = np.ascontiguousarray(item)
+                self._writer.send(memoryview(frame))
+            except BaseException as exc:
+                self._error = exc
+                self.path.unlink(missing_ok=True)
+                return
 
     def write(self, frame: np.ndarray) -> None:
-        try:
-            self._writer.send(frame.tobytes())
-        except Exception:
-            self.path.unlink(missing_ok=True)
-            raise
+        if self._error is not None:
+            raise self._error
+        self._queue.put(frame)
 
     def release(self) -> None:
+        if self._thread.is_alive():
+            self._queue.put(self._SENTINEL)
+            self._thread.join()
         try:
             self._writer.close()
         except Exception:
             self.path.unlink(missing_ok=True)
             raise
+        if self._error is not None:
+            self.path.unlink(missing_ok=True)
+            raise self._error
         if not self.path.is_file() or self.path.stat().st_size == 0:
             self.path.unlink(missing_ok=True)
             raise RuntimeError("H.264 encoding produced no annotated video.")
@@ -465,12 +493,14 @@ def _analyze(job: dict, video: dict, config: dict) -> None:
                 writer.release()
             _finish_cancelled(job_id, annotated_path)
             return
-        ok, frame = capture.read()
-        if not ok:
+        if not capture.grab():
             break
         if not _should_process_frame(frame_index, processed, fps, sample_fps, stride):
             frame_index += 1
             continue
+        ok, frame = capture.retrieve()
+        if not ok:
+            break
         timestamp = _frame_timestamp(frame_index, fps)
         debug_input = frame.copy() if debug_dir is not None and processed < 10 else None
         inference_started = time.perf_counter()
@@ -641,16 +671,22 @@ def _analyze(job: dict, video: dict, config: dict) -> None:
                 cv2.LINE_AA,
             )
 
+        has_motorcycle = any(det.class_name == "motorcycle" for det in tracked)
         if helmet_engine is not None:
-            frame_helmet_detections = helmet_engine.predict(frame, frame_index, timestamp)
+            frame_helmet_detections = (
+                helmet_engine.predict(frame, frame_index, timestamp)
+                if has_motorcycle
+                else []
+            )
             tracked_helmet_detections = helmet_tracker.update(
                 frame_helmet_detections, frame_index, timestamp
             )
-            helmet_detections.extend(
-                _associate_helmet_detections(
-                    tracked_helmet_detections, tracked_persons_and_motorcycles
+            if frame_helmet_detections:
+                helmet_detections.extend(
+                    _associate_helmet_detections(
+                        tracked_helmet_detections, tracked_persons_and_motorcycles
+                    )
                 )
-            )
         elif config.get("enable_helmet", True):
             # COCO has no helmet class — use person-on-motorcycle as a review heuristic.
             helmet_detections.extend(
